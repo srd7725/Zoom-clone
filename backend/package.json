@@ -5,7 +5,7 @@
   "license": "ISC",
   "author": "sharad kumar",
   "type": "module",
-  "main": "index.js",
+  "main": "app.js",
   "scripts": {
     "dev": "nodemon src/app.js",
     "start": "node src/app.js",
