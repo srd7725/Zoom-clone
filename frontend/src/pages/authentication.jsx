@@ -25,11 +25,11 @@ export default function Authentication() {
 
     
 
-    const [username, setUsername] = React.useState();
-    const [password, setPassword] = React.useState();
-    const [name, setName] = React.useState();
-    const [error, setError] = React.useState();
-    const [message, setMessage] = React.useState();
+    const [username, setUsername] = React.useState(localStorage.getItem("signup_username") || "");
+    const [password, setPassword] = React.useState(localStorage.getItem("signup_password") || "");
+    const [name, setName] = React.useState(localStorage.getItem("signup_name") || "");
+    const [error, setError] = React.useState("");
+    const [message, setMessage] = React.useState("");
 
 
     const [formState, setFormState] = React.useState(0);
@@ -48,14 +48,27 @@ export default function Authentication() {
 
             }
             if (formState === 1) {
+                const trimmedName = name.trim();
+                const nameParts = trimmedName.split(/\s+/);
+                if (nameParts.length < 2 || !nameParts.every(part => /[a-zA-Z]/.test(part))) {
+                    setError("Please enter your full name (First Name and Last Name).");
+                    return;
+                }
+
+                if (password.length !== 6) {
+                    setError("Password must be exactly 6 characters long.");
+                    return;
+                }
+
                 let result = await handleRegister(name, username, password);
                 console.log(result);
-                setUsername("");
+                localStorage.setItem("signup_name", name);
+                localStorage.setItem("signup_username", username);
+                localStorage.setItem("signup_password", password);
                 setMessage(result);
                 setOpen(true);
                 setError("")
                 setFormState(0)
-                setPassword("")
             }
         } catch (err) {
 
@@ -113,9 +126,9 @@ export default function Authentication() {
                                 margin="normal"
                                 required
                                 fullWidth
-                                id="username"
+                                id="name"
                                 label="Full Name"
-                                name="username"
+                                name="name"
                                 value={name}
                                 autoFocus
                                 onChange={(e) => setName(e.target.value)}
