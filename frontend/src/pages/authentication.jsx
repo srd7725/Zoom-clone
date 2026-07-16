@@ -51,7 +51,7 @@ export default function Authentication() {
                 const trimmedName = name.trim();
                 const nameParts = trimmedName.split(/\s+/);
                 if (nameParts.length < 2 || !nameParts.every(part => /[a-zA-Z]/.test(part))) {
-                    setError("Please enter your full name (First Name and Last Name).");
+                    setError("Please enter your full name.");
                     return;
                 }
 
@@ -73,7 +73,7 @@ export default function Authentication() {
         } catch (err) {
 
             console.log(err);
-            let message = (err.response.data.message);
+            let message = err?.response?.data?.message || err?.message || "Something went wrong";
             setError(message);
         }
     }

@@ -1,4 +1,5 @@
 import { User } from "../models/user.model.js";
+import { Meeting } from "../models/meeting.model.js";
 import httpStatus from "http-status";
 import bcrypt from "bcrypt";
 import crypto from "crypto";
@@ -41,7 +42,7 @@ const register = async (req, res) => {
     const trimmedName = (name || "").trim();
     const nameParts = trimmedName.split(/\s+/);
     if (nameParts.length < 2 || !nameParts.every(part => /[a-zA-Z]/.test(part))) {
-        return res.status(400).json({message: "Please enter your full name (First Name and Last Name)."});
+        return res.status(400).json({message: "Please enter your full name."});
     }
 
     if (!password || password.length !== 6) {
@@ -51,7 +52,7 @@ const register = async (req, res) => {
     try {
         const existingUser = await User.findOne({ username });
         if (existingUser) {
-            return res.status(httpStatus.FOUND).json({message: "User already exists"});
+            return res.status(409).json({message: "User already exists"});
 
         }
 
@@ -71,5 +72,41 @@ const register = async (req, res) => {
         res.json({message: `Something went wrong ${e}` });
     }
 }
+const getUserHistory = async (req, res) => {
+    const { token } = req.query;
 
-export {login, register}
+    try {
+        const user = await User.findOne({ token: token });
+        if (!user) {
+            return res.status(httpStatus.NOT_FOUND).json({ message: "User not found" });
+        }
+
+        const meetings = await Meeting.find({ user_id: user.username });
+        res.json(meetings);
+    } catch (e) {
+        res.json({ message: `Something went wrong ${e}` });
+    }
+}
+
+const addToHistory = async (req, res) => {
+    const { token, meeting_code } = req.body;
+
+    try {
+        const user = await User.findOne({ token: token });
+        if (!user) {
+            return res.status(httpStatus.NOT_FOUND).json({ message: "User not found" });
+        }
+
+        const newMeeting = new Meeting({
+            user_id: user.username,
+            meetingCode: meeting_code
+        });
+
+        await newMeeting.save();
+        res.status(httpStatus.CREATED).json({ message: "Added code to history" });
+    } catch (e) {
+        res.json({ message: `Something went wrong ${e}` });
+    }
+}
+
+export {login, register, getUserHistory, addToHistory}
