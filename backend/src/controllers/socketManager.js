@@ -1,11 +1,47 @@
-import { Server } from "socket.io"
+import { Server } from "socket.io";
+import { Meeting } from "../models/meeting.model.js";
 
-let connections = {}
-let messages = {}
-let timeOnline = {}
-let users = {} // { socketId: { username, isHost, path } }
-let waitingRooms = {} // { path: [ { socketId, username } ] }
-let meetingHosts = {} // { path: socketId }
+const rooms = {};
+const roomUsers = {};
+const roomMessages = {};
+const roomWaiting = {};
+const roomHosts = {};
+const userRooms = {};
+
+const normalizePath = (path) => {
+    if (!path) return "";
+
+    let normalized = path;
+    try {
+        const parsed = new URL(path);
+        normalized = parsed.pathname;
+    } catch (error) {
+        normalized = path.split("?")[0].split("#")[0];
+    }
+
+    const cleaned = normalized.replace(/^\/+|\/+$/g, "");
+    if (!cleaned) return "";
+
+    const parts = cleaned.split("/");
+    return parts[parts.length - 1] || "";
+};
+
+const getRoomInfo = (roomName) => {
+    if (!rooms[roomName]) rooms[roomName] = [];
+    if (!roomUsers[roomName]) roomUsers[roomName] = {};
+    if (!roomMessages[roomName]) roomMessages[roomName] = [];
+    if (!roomWaiting[roomName]) roomWaiting[roomName] = [];
+    return { roomName };
+};
+
+const syncMeetingWithSocketState = async (roomName, update) => {
+    if (!roomName) return;
+    try {
+        await Meeting.updateOne({ meetingCode: roomName }, update, { runValidators: true });
+    } catch (error) {
+        console.log(error);
+    }
+};
 
 export const connectToSocket = (server) => {
     const io = new Server(server, {
@@ -18,152 +54,221 @@ export const connectToSocket = (server) => {
     });
 
     io.on("connection", (socket) => {
-        console.log("SOMETHING CONNECTED:", socket.id)
+        console.log("SOMETHING CONNECTED:", socket.id);
 
-        socket.on("join-call", (path, username, isHost) => {
-            if (connections[path] === undefined) {
-                connections[path] = []
-            }
-            if (waitingRooms[path] === undefined) {
-                waitingRooms[path] = []
-            }
-            
-            users[socket.id] = { username, isHost, path }
-            
+        socket.on("join-room", async ({ roomName, username, isHost }) => {
+            const room = normalizePath(roomName);
+            getRoomInfo(room);
+            const roomSockets = rooms[room];
+            const roomState = roomUsers[room];
+            const waitingRoom = roomWaiting[room];
+
+            userRooms[socket.id] = room;
+            roomState[socket.id] = { socketId: socket.id, username, isHost, joinedAt: new Date() };
+
             if (isHost) {
-                meetingHosts[path] = socket.id;
+                roomHosts[room] = socket.id;
+                const pendingGuests = waitingRoom.filter((entry) => entry.socketId);
+                pendingGuests.forEach((entry) => {
+                    io.to(socket.id).emit("waiting-room-request", { socketId: entry.socketId, username: entry.username });
+                });
             }
 
-            // If not host and there is a host, they might go to waiting room
-            // Let's implement an auto-join for now, but emit a waiting room event if needed
-            // Actually the plan says: if they are not host, wait for admit-participant.
-            // Let's implement a simplified waiting room logic:
-            if (!isHost && meetingHosts[path]) {
-                waitingRooms[path].push({ socketId: socket.id, username });
-                io.to(meetingHosts[path]).emit("waiting-room-request", { socketId: socket.id, username });
-                return; // Do not join call yet
-            }
+            const shouldTrackParticipant = isHost || !roomHosts[room] || roomHosts[room] === socket.id;
 
-            // Join directly if host or no host logic is strictly enforced yet
-            joinCall(socket, path, username);
-        })
-        
-        const joinCall = (socket, path, username) => {
-            if (!connections[path].includes(socket.id)) {
-                connections[path].push(socket.id)
-                timeOnline[socket.id] = new Date();
-            }
-
-            for (let a = 0; a < connections[path].length; a++) {
-                io.to(connections[path][a]).emit("user-joined", socket.id, connections[path])
-            }
-
-            if (messages[path] !== undefined) {
-                for (let a = 0; a < messages[path].length; ++a) {
-                    io.to(socket.id).emit("chat-message", messages[path][a]['data'],
-                        messages[path][a]['sender'], messages[path][a]['socket-id-sender'])
+            if (!isHost) {
+                if (!waitingRoom.some((entry) => entry.socketId === socket.id)) {
+                    waitingRoom.push({ socketId: socket.id, username });
+                }
+                await syncMeetingWithSocketState(room, {
+                    $set: { waitingRoom: waitingRoom.filter((entry) => entry.socketId !== undefined) }
+                });
+                if (roomHosts[room] && roomHosts[room] !== socket.id) {
+                    io.to(roomHosts[room]).emit("waiting-room-request", { socketId: socket.id, username });
+                }
+                socket.emit("waiting-room-status", { message: "Waiting for host to admit you." });
+                if (!shouldTrackParticipant) {
+                    return;
                 }
             }
-        }
 
-        socket.on("admit-participant", (participantSocketId, path) => {
-            // Host admits a user
-            if (meetingHosts[path] === socket.id) {
-                waitingRooms[path] = waitingRooms[path].filter(u => u.socketId !== participantSocketId);
-                const user = users[participantSocketId];
-                if (user) {
-                    io.to(participantSocketId).emit("admitted");
-                    joinCall(io.sockets.sockets.get(participantSocketId) || { id: participantSocketId }, path, user.username);
-                }
+            if (!roomSockets.includes(socket.id)) {
+                roomSockets.push(socket.id);
             }
-        })
-        
-        socket.on("reject-participant", (participantSocketId, path) => {
-             if (meetingHosts[path] === socket.id) {
-                 waitingRooms[path] = waitingRooms[path].filter(u => u.socketId !== participantSocketId);
-                 io.to(participantSocketId).emit("rejected");
-             }
-        })
 
-        socket.on("signal", (toId, message) => {
-            io.to(toId).emit("signal", socket.id, message);
-        })
+            socket.join(room);
+            await syncMeetingWithSocketState(room, {
+                $set: {
+                    waitingRoom: (roomWaiting[room] || []).filter((entry) => entry.socketId !== socket.id)
+                },
+                ...(shouldTrackParticipant ? {
+                    $addToSet: {
+                        participants: { socketId: socket.id, username, joinedAt: new Date() }
+                    }
+                } : {})
+            });
+            io.to(room).emit("user-connected", { socketId: socket.id, username, isHost });
+            io.to(room).emit("participants-updated", Object.values(roomState));
+
+            roomMessages[room].forEach((message) => {
+                socket.emit("chat-message", message.data, message.sender, message.socketId);
+            });
+        });
+
+        socket.on("admit-participant", async (participantSocketId, roomName) => {
+            const room = normalizePath(roomName);
+            if (roomHosts[room] !== socket.id) return;
+
+            roomWaiting[room] = roomWaiting[room].filter((entry) => entry.socketId !== participantSocketId);
+            const participant = roomUsers[room]?.[participantSocketId];
+            if (!participant) return;
+
+            const roomSockets = rooms[room] || [];
+            if (!roomSockets.includes(participantSocketId)) {
+                roomSockets.push(participantSocketId);
+            }
+
+            await syncMeetingWithSocketState(room, {
+                $set: {
+                    waitingRoom: (roomWaiting[room] || []).filter((entry) => entry.socketId !== participantSocketId)
+                },
+                $addToSet: {
+                    participants: { socketId: participantSocketId, username: participant.username, joinedAt: new Date() }
+                }
+            });
+
+            io.sockets.sockets.get(participantSocketId)?.join(room);
+            io.to(participantSocketId).emit("admitted");
+            io.to(room).emit("participants-updated", Object.values(roomUsers[room] || {}));
+            io.to(room).emit("user-connected", { socketId: participantSocketId, username: participant.username, isHost: false });
+            io.to(participantSocketId).emit("participants-updated", Object.values(roomUsers[room] || {}));
+        });
+
+        socket.on("reject-participant", async (participantSocketId, roomName) => {
+            const room = normalizePath(roomName);
+            if (roomHosts[room] !== socket.id) return;
+            roomWaiting[room] = roomWaiting[room].filter((entry) => entry.socketId !== participantSocketId);
+            await syncMeetingWithSocketState(room, {
+                $set: {
+                    waitingRoom: (roomWaiting[room] || []).filter((entry) => entry.socketId !== participantSocketId)
+                }
+            });
+            io.to(participantSocketId).emit("rejected");
+        });
+
+        socket.on("offer", (payload) => {
+            io.to(payload.target).emit("offer", payload);
+        });
+
+        socket.on("answer", (payload) => {
+            io.to(payload.target).emit("answer", payload);
+        });
+
+        socket.on("ice-candidate", (payload) => {
+            io.to(payload.target).emit("ice-candidate", payload);
+        });
 
         socket.on("chat-message", (data, sender) => {
-            const [matchingRoom, found] = Object.entries(connections)
-                .reduce(([room, isFound], [roomKey, roomValue]) => {
-                    if (!isFound && roomValue.includes(socket.id)) {
-                        return [roomKey, true];
-                    }
-                    return [room, isFound];
-                }, ['', false]);
+            const room = userRooms[socket.id];
+            if (!room) return;
+            const messageEntry = { data, sender, socketId: socket.id };
+            roomMessages[room] = roomMessages[room] || [];
+            roomMessages[room].push(messageEntry);
+            io.to(room).emit("chat-message", data, sender, socket.id);
+        });
 
-            if (found === true) {
-                if (messages[matchingRoom] === undefined) {
-                    messages[matchingRoom] = []
+        socket.on("leave-room", (roomName) => {
+            const room = normalizePath(roomName);
+            handleSocketLeave(io, socket, room);
+        });
+
+        socket.on("end-meeting-for-all", async (roomName) => {
+            const room = normalizePath(roomName);
+            if (roomHosts[room] !== socket.id) return;
+
+            const participants = rooms[room] || [];
+            participants.forEach((participantSocketId) => {
+                io.to(participantSocketId).emit("meeting-ended");
+            });
+
+            await syncMeetingWithSocketState(room, {
+                $set: {
+                    isActive: false,
+                    endedAt: new Date(),
+                    participants: [],
+                    waitingRoom: []
                 }
-                messages[matchingRoom].push({ 'sender': sender, "data": data, "socket-id-sender": socket.id })
-                connections[matchingRoom].forEach((elem) => {
-                    io.to(elem).emit("chat-message", data, sender, socket.id)
-                })
-            }
-        })
-        
-        socket.on("end-meeting-for-all", (path) => {
-             if (meetingHosts[path] === socket.id) {
-                 if (connections[path]) {
-                     connections[path].forEach(elem => {
-                         io.to(elem).emit("meeting-ended");
-                     })
-                     delete connections[path];
-                     delete messages[path];
-                     delete waitingRooms[path];
-                     delete meetingHosts[path];
-                 }
-             }
-        })
-        
-        socket.on("remove-participant", (participantSocketId, path) => {
-             if (meetingHosts[path] === socket.id) {
-                 io.to(participantSocketId).emit("removed-by-host");
-             }
-        })
+            });
+
+            delete rooms[room];
+            delete roomUsers[room];
+            delete roomMessages[room];
+            delete roomWaiting[room];
+            delete roomHosts[room];
+        });
+
+        socket.on("remove-participant", (participantSocketId, roomName) => {
+            const room = normalizePath(roomName);
+            if (roomHosts[room] !== socket.id) return;
+            io.to(participantSocketId).emit("removed-by-host");
+        });
 
         socket.on("disconnect", () => {
-            var diffTime = Math.abs(timeOnline[socket.id] - new Date())
-            var key
-
-            for (const [k, v] of JSON.parse(JSON.stringify(Object.entries(connections)))) {
-                for (let a = 0; a < v.length; ++a) {
-                    if (v[a] === socket.id) {
-                        key = k
-
-                        for (let a = 0; a < connections[key].length; ++a) {
-                            io.to(connections[key][a]).emit('user-left', socket.id)
-                        }
-
-                        var index = connections[key].indexOf(socket.id)
-                        connections[key].splice(index, 1)
-
-                        if (connections[key].length === 0) {
-                            delete connections[key]
-                        }
-                    }
-                }
+            const room = userRooms[socket.id];
+            if (room) {
+                handleSocketLeave(io, socket, room);
             }
-            
-            if (users[socket.id]) {
-                const path = users[socket.id].path;
-                if (meetingHosts[path] === socket.id) {
-                    delete meetingHosts[path];
-                }
-                if (waitingRooms[path]) {
-                    waitingRooms[path] = waitingRooms[path].filter(u => u.socketId !== socket.id);
-                }
-                delete users[socket.id];
-            }
-        })
-    })
+        });
+    });
 
     return io;
-}
+};
+
+const handleSocketLeave = async (io, socket, room) => {
+    if (!room) return;
+    const roomSockets = rooms[room] || [];
+    const index = roomSockets.indexOf(socket.id);
+    if (index >= 0) {
+        roomSockets.splice(index, 1);
+    }
+
+    if (roomUsers[room]) {
+        const participantInfo = roomUsers[room][socket.id];
+        delete roomUsers[room][socket.id];
+        if (roomHosts[room] === socket.id) {
+            delete roomHosts[room];
+        }
+        roomWaiting[room] = (roomWaiting[room] || []).filter((entry) => entry.socketId !== socket.id);
+
+        const remainingParticipants = roomUsers[room]
+            ? Object.entries(roomUsers[room]).filter(([, user]) => user?.socketId !== socket.id).map(([socketId, user]) => ({ socketId, username: user.username, joinedAt: user.joinedAt }))
+            : [];
+
+        const updatePayload = {
+            $set: {
+                waitingRoom: (roomWaiting[room] || []).filter((entry) => entry.socketId !== socket.id),
+                participants: remainingParticipants
+            }
+        };
+
+        if (participantInfo?.username) {
+            const hostUser = Object.values(roomUsers[room] || {}).find((user) => user.isHost);
+            updatePayload.$push = {
+                history: {
+                    participant: participantInfo.username,
+                    host: hostUser?.username || "Host",
+                    joinedTime: participantInfo.joinedAt || new Date(),
+                    leftTime: new Date(),
+                    duration: Math.max(0, Math.floor((new Date().getTime() - (participantInfo.joinedAt?.getTime() || new Date().getTime())) / 1000))
+                }
+            };
+        }
+
+        await syncMeetingWithSocketState(room, updatePayload);
+
+        io.to(room).emit("participants-updated", Object.values(roomUsers[room] || {}));
+        io.to(room).emit("user-disconnected", { socketId: socket.id });
+    }
+
+    delete userRooms[socket.id];
+};

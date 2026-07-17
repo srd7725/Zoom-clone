@@ -25,6 +25,14 @@ const meetingSchema = new Schema(
             username: {type: String},
             socketId: {type: String},
             requestedAt: {type: Date, default: Date.now}
+        }],
+
+        history: [{
+            participant: {type: String},
+            host: {type: String},
+            joinedTime: {type: Date},
+            leftTime: {type: Date},
+            duration: {type: Number, default: 0}
         }]
     }
 )
