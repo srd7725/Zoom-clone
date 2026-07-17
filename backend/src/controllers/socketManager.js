@@ -64,7 +64,7 @@ export const connectToSocket = (server) => {
             const waitingRoom = roomWaiting[room];
 
             userRooms[socket.id] = room;
-            roomState[socket.id] = { socketId: socket.id, username, isHost, joinedAt: new Date() };
+            roomState[socket.id] = { socketId: socket.id, username, isHost, joinedAt: new Date(), isVideoOn: true, isAudioOn: true };
 
             if (isHost) {
                 roomHosts[room] = socket.id;
@@ -113,6 +113,17 @@ export const connectToSocket = (server) => {
             roomMessages[room].forEach((message) => {
                 socket.emit("chat-message", message.data, message.sender, message.socketId);
             });
+        });
+
+        socket.on("media-state-change", ({ roomName, isVideoOn, isAudioOn }) => {
+            const room = normalizePath(roomName);
+            if (!roomUsers[room]?.[socket.id]) return;
+            roomUsers[room][socket.id] = {
+                ...roomUsers[room][socket.id],
+                isVideoOn: Boolean(isVideoOn),
+                isAudioOn: Boolean(isAudioOn),
+            };
+            io.to(room).emit("participants-updated", Object.values(roomUsers[room] || {}));
         });
 
         socket.on("admit-participant", async (participantSocketId, roomName) => {
