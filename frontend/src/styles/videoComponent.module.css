@@ -1,16 +1,121 @@
 .meetVideoContainer {
     position: relative;
     height: 100vh;
-    background: rgb(1, 4, 48);
+    background: linear-gradient(135deg, #07111f 0%, #0f172a 100%);
+    overflow: hidden;
+}
+
+.localVideoShell {
+    position: absolute;
+    z-index: 30;
+    border-radius: 16px;
+    overflow: hidden;
+    box-shadow: 0 12px 30px rgba(0, 0, 0, 0.35);
+    border: 1px solid rgba(255, 255, 255, 0.18);
+    background: #111;
+    cursor: grab;
+}
+
+.localVideoShell:active {
+    cursor: grabbing;
 }
 
 .meetUserVideo {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    background: #000;
+}
+
+.localVideoResizeHandle {
     position: absolute;
-    bottom: 10vh;
-    height: 20vh;
-    width: auto;
-    left: 0;
+    right: 6px;
+    bottom: 6px;
+    width: 16px;
+    height: 16px;
+    border-right: 3px solid rgba(255, 255, 255, 0.9);
+    border-bottom: 3px solid rgba(255, 255, 255, 0.9);
+    cursor: nwse-resize;
+}
+
+.meetingMainArea {
+    display: flex;
+    flex-direction: column;
+    height: 100%;
+    padding: 18px 18px 90px 18px;
+    gap: 16px;
+}
+
+.presentationStage {
+    flex: 1;
+    min-height: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
     border-radius: 20px;
+    background: rgba(255, 255, 255, 0.06);
+    border: 1px solid rgba(255, 255, 255, 0.12);
+    overflow: hidden;
+    box-shadow: inset 0 1px 0 rgba(255,255,255,0.08);
+}
+
+.presentationVideo {
+    width: 100%;
+    height: 100%;
+    object-fit: contain;
+    background: #000;
+}
+
+.presentationFallback {
+    text-align: center;
+    color: #fff;
+    padding: 24px;
+}
+
+.participantStrip {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+    gap: 12px;
+}
+
+.participantTile {
+    height: 160px;
+    border-radius: 16px;
+    overflow: hidden;
+    background: rgba(255, 255, 255, 0.08);
+    border: 1px solid rgba(255,255,255,0.12);
+    box-shadow: 0 8px 24px rgba(0,0,0,0.18);
+    position: relative;
+}
+
+.participantVideo {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    background: #000;
+}
+
+.participantAvatar {
+    width: 100%;
+    height: 100%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: linear-gradient(135deg, #334155, #475569);
+    color: #fff;
+    font-size: 2rem;
+    font-weight: 700;
+}
+
+.participantLabel {
+    position: absolute;
+    left: 10px;
+    bottom: 10px;
+    background: rgba(0,0,0,0.65);
+    color: #fff;
+    border-radius: 999px;
+    padding: 6px 10px;
+    font-size: 0.9rem;
 }
 
 .buttonContainers {
@@ -22,21 +127,6 @@
 
 .buttonContainers svg {
     font-size: 3rem;
-}
-
-.conferenceView { 
-
-    display: flex;
-    
-    padding: 10px;
-    gap: 10px;
-}
-
-.conferenceView  video {
-    width: 40vw;
-    height: 20vh;
-    min-width: 30vw;
-    border-radius: 10px;
 }
 
 .chatRoom {
@@ -58,4 +148,27 @@
 .chattingArea {
     position: absolute;
     bottom: 0;
+}
+
+.lobbyPreviewCard {
+    width: 100%;
+    border-radius: 16px;
+    overflow: hidden;
+    box-shadow: 0 12px 30px rgba(0, 0, 0, 0.2);
+    background: #000;
+    border: 1px solid rgba(255, 255, 255, 0.16);
+}
+
+.lobbyPreviewVideo {
+    width: 100%;
+    height: 220px;
+    background: #000;
+    object-fit: cover;
+}
+
+.previewHint {
+    margin-top: 8px;
+    color: #5f6368;
+    font-size: 0.95rem;
+    text-align: center;
 }
