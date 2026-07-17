@@ -83,10 +83,43 @@ export const AuthProvider = ({ children }) => {
             throw e;
         }
     }
+    
+    const createNewMeeting = async (meetingTitle) => {
+        try {
+            let request = await axios.post(`${server}/api/v1/meeting/create`, {
+                token: localStorage.getItem("token"),
+                meetingTitle
+            });
+            return request.data;
+        } catch (e) {
+            throw e;
+        }
+    }
+    
+    const validateMeetingCode = async (meetingCode) => {
+        try {
+            let request = await axios.get(`${server}/api/v1/meeting/validate/${meetingCode}`);
+            return request.data;
+        } catch (e) {
+            throw e;
+        }
+    }
+    
+    const endActiveMeeting = async (meetingCode) => {
+        try {
+            let request = await axios.post(`${server}/api/v1/meeting/end`, {
+                token: localStorage.getItem("token"),
+                meetingCode
+            });
+            return request.data;
+        } catch (e) {
+            throw e;
+        }
+    }
 
 
     const data = {
-        userData, setUserData, addToUserHistory, getHistoryOfUser, handleRegister, handleLogin
+        userData, setUserData, addToUserHistory, getHistoryOfUser, handleRegister, handleLogin, createNewMeeting, validateMeetingCode, endActiveMeeting
     }
 
     return (

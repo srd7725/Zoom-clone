@@ -6,6 +6,7 @@ import "dotenv/config";
 
 import { connectToSocket } from "./controllers/socketManager.js";
 import userRoutes from "./routes/users.routes.js";
+import meetingRoutes from "./routes/meeting.routes.js";
 
 const app = express();
 const server = createServer(app);
@@ -17,6 +18,7 @@ app.use(express.json({ limit: "40kb" }));
 app.use(express.urlencoded({ limit: "40kb", extended: true }));
 
 app.use("/api/v1/users", userRoutes);
+app.use("/api/v1/meeting", meetingRoutes);
 
 const start = async () => {
   try {

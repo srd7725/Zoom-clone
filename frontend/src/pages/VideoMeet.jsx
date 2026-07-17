@@ -1,7 +1,6 @@
-import React, { useEffect, useRef, useState } from 'react'
+import React, { useEffect, useRef, useState, useContext } from 'react'
 import io from "socket.io-client";
-import { Badge, IconButton, TextField } from '@mui/material';
-import { Button } from '@mui/material';
+import { Badge, IconButton, TextField, Button, Dialog, DialogTitle, DialogContent, DialogActions, List, ListItem, ListItemText, Snackbar } from '@mui/material';
 import VideocamIcon from '@mui/icons-material/Videocam';
 import VideocamOffIcon from '@mui/icons-material/VideocamOff'
 import styles from "../styles/videoComponent.module.css";
@@ -11,10 +10,12 @@ import MicOffIcon from '@mui/icons-material/MicOff'
 import ScreenShareIcon from '@mui/icons-material/ScreenShare';
 import StopScreenShareIcon from '@mui/icons-material/StopScreenShare'
 import ChatIcon from '@mui/icons-material/Chat'
+import PeopleIcon from '@mui/icons-material/People'
 import server from '../environment';
+import { useNavigate, useLocation } from 'react-router-dom';
+import { AuthContext } from '../contexts/AuthContext';
 
 const server_url = server;
-
 var connections = {};
 
 const peerConfigConnections = {
@@ -24,51 +25,55 @@ const peerConfigConnections = {
 }
 
 export default function VideoMeetComponent() {
+    const navigate = useNavigate();
+    const location = useLocation();
+    const { validateMeetingCode, endActiveMeeting } = useContext(AuthContext);
+    const searchParams = new URLSearchParams(location.search);
+    const isHost = searchParams.get('host') === 'true';
+    const meetingCode = window.location.pathname.replace('/', '');
 
     var socketRef = useRef();
     let socketIdRef = useRef();
-
     let localVideoref = useRef();
 
     let [videoAvailable, setVideoAvailable] = useState(true);
-
     let [audioAvailable, setAudioAvailable] = useState(true);
-
     let [video, setVideo] = useState([]);
-
     let [audio, setAudio] = useState();
-
     let [screen, setScreen] = useState();
-
     let [showModal, setModal] = useState(true);
-
     let [screenAvailable, setScreenAvailable] = useState();
-
     let [messages, setMessages] = useState([])
-
     let [message, setMessage] = useState("");
-
-    let [newMessages, setNewMessages] = useState(3);
-
+    let [newMessages, setNewMessages] = useState(0);
     let [askForUsername, setAskForUsername] = useState(true);
-
     let [username, setUsername] = useState("");
-
     const videoRef = useRef([])
-
     let [videos, setVideos] = useState([])
 
-    // TODO
-    // if(isChrome() === false) {
-
-
-    // }
+    // New states for Zoom Clone features
+    let [isValidating, setIsValidating] = useState(true);
+    let [meetingError, setMeetingError] = useState("");
+    let [inWaitingRoom, setInWaitingRoom] = useState(false);
+    let [waitingUsers, setWaitingUsers] = useState([]);
+    let [showParticipants, setShowParticipants] = useState(false);
+    let [snackOpen, setSnackOpen] = useState(false);
+    let [snackMessage, setSnackMessage] = useState("");
 
     useEffect(() => {
-        console.log("HELLO")
-        getPermissions();
+        validateMeeting();
+    }, []);
 
-    })
+    const validateMeeting = async () => {
+        try {
+            await validateMeetingCode(meetingCode);
+            setIsValidating(false);
+            getPermissions();
+        } catch (err) {
+            setMeetingError(err?.response?.data?.message || "Invalid Meeting Code");
+            setIsValidating(false);
+        }
+    }
 
     let getDislayMedia = () => {
         if (screen) {
@@ -83,22 +88,18 @@ export default function VideoMeetComponent() {
 
     const getPermissions = async () => {
         try {
-            const videoPermission = await navigator.mediaDevices.getUserMedia({ video: true });
+            const videoPermission = await navigator.mediaDevices.getUserMedia({ video: true }).catch(() => null);
             if (videoPermission) {
                 setVideoAvailable(true);
-                console.log('Video permission granted');
             } else {
                 setVideoAvailable(false);
-                console.log('Video permission denied');
             }
 
-            const audioPermission = await navigator.mediaDevices.getUserMedia({ audio: true });
+            const audioPermission = await navigator.mediaDevices.getUserMedia({ audio: true }).catch(() => null);
             if (audioPermission) {
                 setAudioAvailable(true);
-                console.log('Audio permission granted');
             } else {
                 setAudioAvailable(false);
-                console.log('Audio permission denied');
             }
 
             if (navigator.mediaDevices.getDisplayMedia) {
@@ -107,8 +108,8 @@ export default function VideoMeetComponent() {
                 setScreenAvailable(false);
             }
 
-            if (videoAvailable || audioAvailable) {
-                const userMediaStream = await navigator.mediaDevices.getUserMedia({ video: videoAvailable, audio: audioAvailable });
+            if (videoPermission || audioPermission) {
+                const userMediaStream = await navigator.mediaDevices.getUserMedia({ video: !!videoPermission, audio: !!audioPermission });
                 if (userMediaStream) {
                     window.localStream = userMediaStream;
                     if (localVideoref.current) {
@@ -122,23 +123,16 @@ export default function VideoMeetComponent() {
     };
 
     useEffect(() => {
-        if (video !== undefined && audio !== undefined) {
+        if (video !== undefined && audio !== undefined && !askForUsername && !inWaitingRoom) {
             getUserMedia();
-            console.log("SET STATE HAS ", video, audio);
-
         }
-
-
     }, [video, audio])
+
     let getMedia = () => {
         setVideo(videoAvailable);
         setAudio(audioAvailable);
         connectToSocketServer();
-
     }
-
-
-
 
     let getUserMediaSuccess = (stream) => {
         try {
@@ -154,7 +148,6 @@ export default function VideoMeetComponent() {
             connections[id].addStream(window.localStream)
 
             connections[id].createOffer().then((description) => {
-                console.log(description)
                 connections[id].setLocalDescription(description)
                     .then(() => {
                         socketRef.current.emit('signal', id, JSON.stringify({ 'sdp': connections[id].localDescription }))
@@ -194,7 +187,6 @@ export default function VideoMeetComponent() {
         if ((video && videoAvailable) || (audio && audioAvailable)) {
             navigator.mediaDevices.getUserMedia({ video: video, audio: audio })
                 .then(getUserMediaSuccess)
-                .then((stream) => { })
                 .catch((e) => console.log(e))
         } else {
             try {
@@ -204,12 +196,7 @@ export default function VideoMeetComponent() {
         }
     }
 
-
-
-
-
     let getDislayMediaSuccess = (stream) => {
-        console.log("HERE")
         try {
             window.localStream.getTracks().forEach(track => track.stop())
         } catch (e) { console.log(e) }
@@ -244,7 +231,6 @@ export default function VideoMeetComponent() {
             localVideoref.current.srcObject = window.localStream
 
             getUserMedia()
-
         })
     }
 
@@ -270,16 +256,13 @@ export default function VideoMeetComponent() {
         }
     }
 
-
-
-
     let connectToSocketServer = () => {
         socketRef.current = io.connect(server_url, { secure: false })
 
         socketRef.current.on('signal', gotMessageFromServer)
 
         socketRef.current.on('connect', () => {
-            socketRef.current.emit('join-call', window.location.href)
+            socketRef.current.emit('join-call', window.location.href, username, isHost)
             socketIdRef.current = socketRef.current.id
 
             socketRef.current.on('chat-message', addMessage)
@@ -288,28 +271,50 @@ export default function VideoMeetComponent() {
                 setVideos((videos) => videos.filter((video) => video.socketId !== id))
             })
 
+            socketRef.current.on('waiting-room-request', (data) => {
+                setWaitingUsers(prev => [...prev, data]);
+                setSnackMessage(`${data.username} wants to join`);
+                setSnackOpen(true);
+            })
+
+            socketRef.current.on('admitted', () => {
+                setInWaitingRoom(false);
+            })
+
+            socketRef.current.on('rejected', () => {
+                alert("The host declined your request.");
+                window.location.href = "/home";
+            })
+
+            socketRef.current.on('meeting-ended', () => {
+                alert("The host has ended the meeting.");
+                window.location.href = "/home";
+            })
+            
+            socketRef.current.on('removed-by-host', () => {
+                alert("You have been removed from the meeting.");
+                window.location.href = "/home";
+            })
+
             socketRef.current.on('user-joined', (id, clients) => {
+                // If we were in waiting room but get this, we are admitted or auto-joined
+                setInWaitingRoom(false);
+                
                 clients.forEach((socketListId) => {
+                    if (connections[socketListId]) return; // Prevent duplicate
 
                     connections[socketListId] = new RTCPeerConnection(peerConfigConnections)
-                    // Wait for their ice candidate       
+                    
                     connections[socketListId].onicecandidate = function (event) {
                         if (event.candidate != null) {
                             socketRef.current.emit('signal', socketListId, JSON.stringify({ 'ice': event.candidate }))
                         }
                     }
 
-                    // Wait for their video stream
                     connections[socketListId].onaddstream = (event) => {
-                        console.log("BEFORE:", videoRef.current);
-                        console.log("FINDING ID: ", socketListId);
-
                         let videoExists = videoRef.current.find(video => video.socketId === socketListId);
 
                         if (videoExists) {
-                            console.log("FOUND EXISTING");
-
-                            // Update the stream of the existing video
                             setVideos(videos => {
                                 const updatedVideos = videos.map(video =>
                                     video.socketId === socketListId ? { ...video, stream: event.stream } : video
@@ -318,15 +323,12 @@ export default function VideoMeetComponent() {
                                 return updatedVideos;
                             });
                         } else {
-                            // Create a new video
-                            console.log("CREATING NEW");
                             let newVideo = {
                                 socketId: socketListId,
                                 stream: event.stream,
                                 autoplay: true,
                                 playsinline: true
                             };
-
                             setVideos(videos => {
                                 const updatedVideos = [...videos, newVideo];
                                 videoRef.current = updatedVideos;
@@ -335,8 +337,6 @@ export default function VideoMeetComponent() {
                         }
                     };
 
-
-                    // Add the local video stream
                     if (window.localStream !== undefined && window.localStream !== null) {
                         connections[socketListId].addStream(window.localStream)
                     } else {
@@ -384,11 +384,9 @@ export default function VideoMeetComponent() {
 
     let handleVideo = () => {
         setVideo(!video);
-        // getUserMedia();
     }
     let handleAudio = () => {
         setAudio(!audio)
-        // getUserMedia();
     }
 
     useEffect(() => {
@@ -396,27 +394,21 @@ export default function VideoMeetComponent() {
             getDislayMedia();
         }
     }, [screen])
+    
     let handleScreen = () => {
         setScreen(!screen);
     }
 
-    let handleEndCall = () => {
+    let handleEndCall = async () => {
         try {
-            let tracks = localVideoref.current.srcObject.getTracks()
-            tracks.forEach(track => track.stop())
-        } catch (e) { }
-        window.location.href = "/"
-    }
-
-    let openChat = () => {
-        setModal(true);
-        setNewMessages(0);
-    }
-    let closeChat = () => {
-        setModal(false);
-    }
-    let handleMessage = (e) => {
-        setMessage(e.target.value);
+            if (isHost) {
+                await endActiveMeeting(meetingCode);
+                socketRef.current.emit('end-meeting-for-all', window.location.href);
+            }
+            let tracks = localVideoref.current.srcObject?.getTracks()
+            if (tracks) tracks.forEach(track => track.stop())
+        } catch (e) { console.log(e) }
+        window.location.href = "/home"
     }
 
     const addMessage = (data, sender, socketIdSender) => {
@@ -429,55 +421,77 @@ export default function VideoMeetComponent() {
         }
     };
 
-
-
     let sendMessage = () => {
-        console.log(socketRef.current);
         socketRef.current.emit('chat-message', message, username)
         setMessage("");
-
-        // this.setState({ message: "", sender: username })
     }
 
-    
     let connect = () => {
+        if(!username) {
+            setSnackMessage("Please enter your name");
+            setSnackOpen(true);
+            return;
+        }
         setAskForUsername(false);
+        if (!isHost) {
+            setInWaitingRoom(true);
+        }
         getMedia();
     }
+    
+    // Host Control Functions
+    const admitUser = (socketId) => {
+        socketRef.current.emit('admit-participant', socketId, window.location.href);
+        setWaitingUsers(prev => prev.filter(u => u.socketId !== socketId));
+    }
 
+    const rejectUser = (socketId) => {
+        socketRef.current.emit('reject-participant', socketId, window.location.href);
+        setWaitingUsers(prev => prev.filter(u => u.socketId !== socketId));
+    }
+
+    const removeUser = (socketId) => {
+        socketRef.current.emit('remove-participant', socketId, window.location.href);
+    }
+
+    if (isValidating) {
+        return <div style={{ display: 'flex', justifyContent: 'center', alignItems: 'center', height: '100vh' }}><h2>Validating Meeting...</h2></div>
+    }
+
+    if (meetingError) {
+        return (
+            <div style={{ display: 'flex', flexDirection: 'column', justifyContent: 'center', alignItems: 'center', height: '100vh' }}>
+                <h2>{meetingError}</h2>
+                <Button variant="contained" onClick={() => navigate('/home')} style={{ marginTop: '20px' }}>Go Home</Button>
+            </div>
+        )
+    }
 
     return (
         <div>
-
             {askForUsername === true ?
-
-                <div>
-
-
-                    <h2>Enter into Lobby </h2>
-                    <TextField id="outlined-basic" label="Username" value={username} onChange={e => setUsername(e.target.value)} variant="outlined" />
-                    <Button variant="contained" onClick={connect}>Connect</Button>
-
-
-                    <div>
-                        <video ref={localVideoref} autoPlay muted></video>
+                <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', height: '100vh' }}>
+                    <h2>Enter into Lobby</h2>
+                    <div style={{ display: 'flex', gap: '10px', marginBottom: '20px' }}>
+                        <TextField id="outlined-basic" label="Username" value={username} onChange={e => setUsername(e.target.value)} variant="outlined" />
+                        <Button variant="contained" onClick={connect}>Join Meeting</Button>
                     </div>
-
+                    <div style={{ width: '600px', maxWidth: '90%', borderRadius: '10px', overflow: 'hidden', backgroundColor: '#000' }}>
+                        <video ref={localVideoref} autoPlay muted style={{ width: '100%' }}></video>
+                    </div>
                 </div> :
 
+            inWaitingRoom ?
+                <div style={{ display: 'flex', justifyContent: 'center', alignItems: 'center', height: '100vh' }}>
+                    <h2>Waiting for the host to let you in...</h2>
+                </div> :
 
                 <div className={styles.meetVideoContainer}>
-
                     {showModal ? <div className={styles.chatRoom}>
-
                         <div className={styles.chatContainer}>
                             <h1>Chat</h1>
-
                             <div className={styles.chattingDisplay}>
-
                                 {messages.length !== 0 ? messages.map((item, index) => {
-
-                                    console.log(messages)
                                     return (
                                         <div style={{ marginBottom: "20px" }} key={index}>
                                             <p style={{ fontWeight: "bold" }}>{item.sender}</p>
@@ -485,43 +499,41 @@ export default function VideoMeetComponent() {
                                         </div>
                                     )
                                 }) : <p>No Messages Yet</p>}
-
-
                             </div>
-
                             <div className={styles.chattingArea}>
                                 <TextField value={message} onChange={(e) => setMessage(e.target.value)} id="outlined-basic" label="Enter Your chat" variant="outlined" />
                                 <Button variant='contained' onClick={sendMessage}>Send</Button>
                             </div>
-
-
                         </div>
                     </div> : <></>}
-
 
                     <div className={styles.buttonContainers}>
                         <IconButton onClick={handleVideo} style={{ color: "white" }}>
                             {(video === true) ? <VideocamIcon /> : <VideocamOffIcon />}
                         </IconButton>
-                        <IconButton onClick={handleEndCall} style={{ color: "red" }}>
-                            <CallEndIcon  />
-                        </IconButton>
                         <IconButton onClick={handleAudio} style={{ color: "white" }}>
                             {audio === true ? <MicIcon /> : <MicOffIcon />}
                         </IconButton>
-
                         {screenAvailable === true ?
                             <IconButton onClick={handleScreen} style={{ color: "white" }}>
                                 {screen === true ? <ScreenShareIcon /> : <StopScreenShareIcon />}
                             </IconButton> : <></>}
-
-                        <Badge badgeContent={newMessages} max={999} color='orange'>
+                        <Badge badgeContent={newMessages} max={999} color='warning'>
                             <IconButton onClick={() => setModal(!showModal)} style={{ color: "white" }}>
-                                <ChatIcon />                        </IconButton>
+                                <ChatIcon />                        
+                            </IconButton>
                         </Badge>
-
+                        {isHost && (
+                            <Badge badgeContent={waitingUsers.length} color='error'>
+                                <IconButton onClick={() => setShowParticipants(true)} style={{ color: "white" }}>
+                                    <PeopleIcon />                        
+                                </IconButton>
+                            </Badge>
+                        )}
+                        <Button variant="contained" color="error" onClick={handleEndCall} style={{ marginLeft: '10px' }}>
+                            {isHost ? "End Meeting" : "Leave"}
+                        </Button>
                     </div>
-
 
                     <video className={styles.meetUserVideo} ref={localVideoref} autoPlay muted></video>
 
@@ -529,7 +541,6 @@ export default function VideoMeetComponent() {
                         {videos.map((video) => (
                             <div key={video.socketId}>
                                 <video
-
                                     data-socket={video.socketId}
                                     ref={ref => {
                                         if (ref && video.stream) {
@@ -540,15 +551,57 @@ export default function VideoMeetComponent() {
                                 >
                                 </video>
                             </div>
-
                         ))}
-
                     </div>
-
+                    
+                    {/* Participants Modal for Host */}
+                    <Dialog open={showParticipants} onClose={() => setShowParticipants(false)} fullWidth maxWidth="sm">
+                        <DialogTitle>Participants & Waiting Room</DialogTitle>
+                        <DialogContent>
+                            <h3>Waiting Room ({waitingUsers.length})</h3>
+                            <List>
+                                {waitingUsers.map(u => (
+                                    <ListItem key={u.socketId} secondaryAction={
+                                        <div>
+                                            <Button size="small" variant="contained" color="success" onClick={() => admitUser(u.socketId)} style={{ marginRight: '5px' }}>Admit</Button>
+                                            <Button size="small" variant="contained" color="error" onClick={() => rejectUser(u.socketId)}>Reject</Button>
+                                        </div>
+                                    }>
+                                        <ListItemText primary={u.username} />
+                                    </ListItem>
+                                ))}
+                                {waitingUsers.length === 0 && <p style={{marginLeft: '15px'}}>No one is waiting.</p>}
+                            </List>
+                            <hr />
+                            <h3>In Meeting ({videos.length + 1})</h3>
+                            <List>
+                                <ListItem>
+                                    <ListItemText primary={`${username} (You)`} />
+                                </ListItem>
+                                {videos.map(v => {
+                                    // Normally we would sync socket IDs to usernames here, but for simplicity we just show ID or generic name
+                                    return (
+                                    <ListItem key={v.socketId} secondaryAction={
+                                        <Button size="small" variant="outlined" color="error" onClick={() => removeUser(v.socketId)}>Remove</Button>
+                                    }>
+                                        <ListItemText primary={`Participant (${v.socketId.substring(0,4)})`} />
+                                    </ListItem>
+                                )})}
+                            </List>
+                        </DialogContent>
+                        <DialogActions>
+                            <Button onClick={() => setShowParticipants(false)}>Close</Button>
+                        </DialogActions>
+                    </Dialog>
+                    
+                    <Snackbar
+                        open={snackOpen}
+                        autoHideDuration={4000}
+                        onClose={() => setSnackOpen(false)}
+                        message={snackMessage}
+                    />
                 </div>
-
             }
-
         </div>
     )
 }
