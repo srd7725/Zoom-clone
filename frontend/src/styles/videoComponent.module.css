@@ -1,98 +1,190 @@
 .meetVideoContainer {
     position: relative;
-    height: 100vh;
-    background: linear-gradient(135deg, #07111f 0%, #0f172a 100%);
+    min-height: 100vh;
     overflow: hidden;
-}
-
-.localVideoShell {
-    position: absolute;
-    z-index: 30;
-    border-radius: 16px;
-    overflow: hidden;
-    box-shadow: 0 12px 30px rgba(0, 0, 0, 0.35);
-    border: 1px solid rgba(255, 255, 255, 0.18);
-    background: #111;
-    cursor: grab;
-}
-
-.localVideoShell:active {
-    cursor: grabbing;
-}
-
-.meetUserVideo {
-    width: 100%;
-    height: 100%;
-    object-fit: cover;
-    background: #000;
-}
-
-.localVideoResizeHandle {
-    position: absolute;
-    right: 6px;
-    bottom: 6px;
-    width: 16px;
-    height: 16px;
-    border-right: 3px solid rgba(255, 255, 255, 0.9);
-    border-bottom: 3px solid rgba(255, 255, 255, 0.9);
-    cursor: nwse-resize;
+    background: #212442;
+    color: #fff;
 }
 
 .meetingMainArea {
-    display: flex;
-    flex-direction: column;
-    height: 100%;
-    padding: 18px 18px 90px 18px;
-    gap: 16px;
+    display: grid;
+    grid-template-columns: minmax(520px, 1fr) minmax(360px, 420px);
+    gap: 20px;
+    height: 100vh;
+    padding: 24px 24px 104px;
 }
 
-.presentationStage {
-    flex: 1;
+.hostStage {
+    min-width: 0;
     min-height: 0;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    border-radius: 20px;
-    background: rgba(255, 255, 255, 0.06);
-    border: 1px solid rgba(255, 255, 255, 0.12);
-    overflow: hidden;
-    box-shadow: inset 0 1px 0 rgba(255,255,255,0.08);
 }
 
+.hostVideoCard {
+    position: relative;
+    height: 100%;
+    min-height: 420px;
+    overflow: hidden;
+    border: 1px solid rgba(255, 255, 255, 0.12);
+    border-radius: 18px;
+    background: #0b1022;
+    box-shadow: 0 24px 60px rgba(0, 0, 0, 0.28);
+}
+
+.meetUserVideo,
 .presentationVideo {
     width: 100%;
     height: 100%;
+    object-fit: cover;
+    background: #050711;
+}
+
+.presentationVideo {
     object-fit: contain;
-    background: #000;
 }
 
-.presentationFallback {
-    text-align: center;
-    color: #fff;
-    padding: 24px;
+.hostAvatar {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: radial-gradient(circle at top left, #3a4070, #11152b 62%);
 }
 
-.participantStrip {
-    display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+.hostAvatar span {
+    display: flex;
+    width: 120px;
+    height: 120px;
+    align-items: center;
+    justify-content: center;
+    border-radius: 50%;
+    background: linear-gradient(135deg, #6d7cff, #22c1c3);
+    font-size: 3rem;
+    font-weight: 800;
+    letter-spacing: 0;
+    box-shadow: 0 18px 40px rgba(0, 0, 0, 0.35);
+}
+
+.hostStatusBar {
+    position: absolute;
+    left: 18px;
+    right: 18px;
+    bottom: 18px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 14px;
+    border: 1px solid rgba(255, 255, 255, 0.12);
+    border-radius: 14px;
+    background: rgba(6, 9, 24, 0.72);
+    padding: 12px 14px;
+    font-weight: 700;
+    backdrop-filter: blur(14px);
+}
+
+.statusPills {
+    display: flex;
+    gap: 8px;
+}
+
+.statusPill,
+.statusPillOff {
+    display: inline-flex;
+    width: 34px;
+    height: 34px;
+    align-items: center;
+    justify-content: center;
+    border-radius: 50%;
+}
+
+.statusPill {
+    background: rgba(34, 197, 94, 0.16);
+    color: #86efac;
+}
+
+.statusPillOff {
+    background: rgba(239, 68, 68, 0.18);
+    color: #fca5a5;
+}
+
+.sidePanel {
+    min-width: 0;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+}
+
+.panelHeader,
+.chatHeader {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
     gap: 12px;
 }
 
-.participantTile {
-    height: 160px;
-    border-radius: 16px;
-    overflow: hidden;
+.panelHeader h2,
+.chatHeader h2 {
+    margin: 0;
+    font-size: 1.2rem;
+    font-weight: 800;
+}
+
+.panelEyebrow {
+    margin: 0 0 4px;
+    color: #aeb8ff;
+    font-size: 0.72rem;
+    font-weight: 800;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+}
+
+.viewMoreBadge,
+.chatHeader span {
+    border: 1px solid rgba(255, 255, 255, 0.12);
+    border-radius: 999px;
     background: rgba(255, 255, 255, 0.08);
-    border: 1px solid rgba(255,255,255,0.12);
-    box-shadow: 0 8px 24px rgba(0,0,0,0.18);
+    padding: 6px 10px;
+    color: #d8ddff;
+    font-size: 0.78rem;
+    font-weight: 800;
+}
+
+.participantGrid {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 12px;
+    max-height: 402px;
+    overflow-y: auto;
+    padding-right: 4px;
+}
+
+.participantGrid::-webkit-scrollbar,
+.chattingDisplay::-webkit-scrollbar {
+    width: 6px;
+}
+
+.participantGrid::-webkit-scrollbar-thumb,
+.chattingDisplay::-webkit-scrollbar-thumb {
+    border-radius: 999px;
+    background: rgba(255, 255, 255, 0.22);
+}
+
+.participantTile {
     position: relative;
+    height: 126px;
+    overflow: hidden;
+    border: 1px solid rgba(255, 255, 255, 0.12);
+    border-radius: 14px;
+    background: #303754;
+    box-shadow: 0 14px 32px rgba(0, 0, 0, 0.18);
 }
 
 .participantVideo {
     width: 100%;
     height: 100%;
     object-fit: cover;
-    background: #000;
+    background: #050711;
 }
 
 .participantAvatar {
@@ -101,69 +193,180 @@
     display: flex;
     align-items: center;
     justify-content: center;
-    background: linear-gradient(135deg, #334155, #475569);
+    background: linear-gradient(135deg, #303754, #465174);
     color: #fff;
     font-size: 2rem;
-    font-weight: 700;
+    font-weight: 800;
 }
 
 .participantLabel {
     position: absolute;
     left: 10px;
     bottom: 10px;
-    background: rgba(0,0,0,0.65);
-    color: #fff;
+    max-width: calc(100% - 20px);
+    overflow: hidden;
     border-radius: 999px;
+    background: rgba(5, 8, 20, 0.78);
     padding: 6px 10px;
-    font-size: 0.9rem;
+    color: #fff;
+    font-size: 0.78rem;
+    font-weight: 800;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.emptyParticipants {
+    grid-column: 1 / -1;
+    min-height: 126px;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+    border: 1px dashed rgba(255, 255, 255, 0.16);
+    border-radius: 14px;
+    color: #cbd5ff;
+    background: rgba(255, 255, 255, 0.05);
+}
+
+.emptyParticipants p {
+    margin: 0;
+    font-weight: 700;
+}
+
+.chatCard {
+    min-height: 0;
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    overflow: hidden;
+    border: 1px solid rgba(255, 255, 255, 0.12);
+    border-radius: 18px;
+    background: rgba(255, 255, 255, 0.08);
+    padding: 16px;
+    box-shadow: 0 16px 36px rgba(0, 0, 0, 0.18);
+}
+
+.chattingDisplay {
+    min-height: 150px;
+    flex: 1;
+    overflow-y: auto;
+    border-radius: 14px;
+    background: rgba(8, 11, 28, 0.54);
+    padding: 12px;
+}
+
+.chatBubble {
+    width: fit-content;
+    max-width: 88%;
+    margin-bottom: 10px;
+    border-radius: 14px;
+    background: rgba(255, 255, 255, 0.11);
+    padding: 9px 11px;
+}
+
+.chatBubble p {
+    margin: 0 0 4px;
+    color: #aeb8ff;
+    font-size: 0.72rem;
+    font-weight: 800;
+}
+
+.chatBubble span {
+    color: #fff;
+    font-size: 0.92rem;
+}
+
+.emptyChat {
+    display: flex;
+    height: 100%;
+    min-height: 128px;
+    align-items: center;
+    justify-content: center;
+    margin: 0;
+    color: #b9c1ea;
+    font-weight: 700;
+}
+
+.chattingArea {
+    display: grid;
+    grid-template-columns: 1fr auto;
+    gap: 10px;
+}
+
+.chatInput {
+    min-width: 0;
+    height: 44px;
+    border: 1px solid rgba(255, 255, 255, 0.12);
+    border-radius: 12px;
+    outline: none;
+    background: rgba(7, 10, 24, 0.72);
+    padding: 0 14px;
+    color: #fff;
+    font-size: 0.95rem;
+}
+
+.chatInput::placeholder {
+    color: #8f98c7;
+}
+
+.chatInput:focus {
+    border-color: rgba(124, 140, 255, 0.75);
+    box-shadow: 0 0 0 3px rgba(124, 140, 255, 0.18);
+}
+
+.sendButton {
+    height: 44px;
+    border: 0;
+    border-radius: 12px;
+    background: #7c8cff;
+    padding: 0 18px;
+    color: #fff;
+    font-weight: 800;
+    cursor: pointer;
+}
+
+.sendButton:hover {
+    background: #6477ff;
 }
 
 .buttonContainers {
     position: absolute;
-    width: 100vw;
-    bottom: 0;
-    text-align: center;
+    left: 50%;
+    bottom: 20px;
+    z-index: 40;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 12px;
+    transform: translateX(-50%);
+    border: 1px solid rgba(255, 255, 255, 0.12);
+    border-radius: 20px;
+    background: rgba(8, 11, 28, 0.78);
+    padding: 12px 16px;
+    box-shadow: 0 18px 42px rgba(0, 0, 0, 0.32);
+    backdrop-filter: blur(16px);
 }
 
 .buttonContainers svg {
-    font-size: 3rem;
-}
-
-.chatRoom {
-    position: absolute;
-    height: 90vh;
-    right: 0;
-    background: white;
-    border-radius: 10px;
-    width: 30vw;
-    padding-inline: 20px;
-}
-
-.chatContainer {
-    position: relative;
-    height: 100%;
-}
-
-
-.chattingArea {
-    position: absolute;
-    bottom: 0;
+    font-size: 2rem;
 }
 
 .lobbyPreviewCard {
     width: 100%;
-    border-radius: 16px;
     overflow: hidden;
-    box-shadow: 0 12px 30px rgba(0, 0, 0, 0.2);
-    background: #000;
     border: 1px solid rgba(255, 255, 255, 0.16);
+    border-radius: 16px;
+    background: #000;
+    box-shadow: 0 12px 30px rgba(0, 0, 0, 0.2);
 }
 
 .lobbyPreviewVideo {
     width: 100%;
     height: 220px;
-    background: #000;
     object-fit: cover;
+    background: #000;
 }
 
 .previewHint {
@@ -171,4 +374,48 @@
     color: #5f6368;
     font-size: 0.95rem;
     text-align: center;
+}
+
+@media (max-width: 1100px) {
+    .meetingMainArea {
+        grid-template-columns: 1fr;
+        overflow-y: auto;
+    }
+
+    .hostVideoCard {
+        height: 52vh;
+    }
+
+    .participantGrid {
+        max-height: none;
+    }
+
+    .chatCard {
+        min-height: 320px;
+    }
+}
+
+@media (max-width: 640px) {
+    .meetingMainArea {
+        padding: 14px 14px 108px;
+    }
+
+    .hostVideoCard {
+        min-height: 300px;
+        border-radius: 14px;
+    }
+
+    .participantGrid {
+        grid-template-columns: 1fr;
+    }
+
+    .buttonContainers {
+        width: calc(100% - 24px);
+        gap: 6px;
+        padding: 10px;
+    }
+
+    .buttonContainers svg {
+        font-size: 1.55rem;
+    }
 }

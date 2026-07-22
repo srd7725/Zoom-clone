@@ -56,7 +56,7 @@ export const connectToSocket = (server) => {
     io.on("connection", (socket) => {
         console.log("SOMETHING CONNECTED:", socket.id);
 
-        socket.on("join-room", async ({ roomName, username, isHost }) => {
+        socket.on("join-room", async ({ roomName, username, isHost, isVideoOn, isAudioOn }) => {
             const room = normalizePath(roomName);
             getRoomInfo(room);
             const roomSockets = rooms[room];
@@ -64,13 +64,33 @@ export const connectToSocket = (server) => {
             const waitingRoom = roomWaiting[room];
 
             userRooms[socket.id] = room;
-            roomState[socket.id] = { socketId: socket.id, username, isHost, joinedAt: new Date() };
+            roomState[socket.id] = { 
+                socketId: socket.id, 
+                username, 
+                isHost, 
+                joinedAt: new Date(),
+                isVideoOn: isVideoOn !== undefined ? isVideoOn : true,
+                isAudioOn: isAudioOn !== undefined ? isAudioOn : true,
+                canUseMic: true,
+                canUseCamera: true
+            };
 
             if (isHost) {
                 roomHosts[room] = socket.id;
+                // Emit current waiting room list to the host on connect
+                socket.emit("waiting-room-list", waitingRoom.map(entry => ({
+                    socketId: entry.socketId,
+                    username: entry.username,
+                    joinedAt: entry.joinedAt || entry.requestedAt || new Date()
+                })));
+                
                 const pendingGuests = waitingRoom.filter((entry) => entry.socketId);
                 pendingGuests.forEach((entry) => {
-                    io.to(socket.id).emit("waiting-room-request", { socketId: entry.socketId, username: entry.username });
+                    io.to(socket.id).emit("waiting-room-request", { 
+                        socketId: entry.socketId, 
+                        username: entry.username,
+                        joinedAt: entry.joinedAt || entry.requestedAt || new Date()
+                    });
                 });
             }
 
@@ -78,13 +98,17 @@ export const connectToSocket = (server) => {
 
             if (!isHost) {
                 if (!waitingRoom.some((entry) => entry.socketId === socket.id)) {
-                    waitingRoom.push({ socketId: socket.id, username });
+                    waitingRoom.push({ socketId: socket.id, username, joinedAt: new Date() });
                 }
                 await syncMeetingWithSocketState(room, {
                     $set: { waitingRoom: waitingRoom.filter((entry) => entry.socketId !== undefined) }
                 });
                 if (roomHosts[room] && roomHosts[room] !== socket.id) {
-                    io.to(roomHosts[room]).emit("waiting-room-request", { socketId: socket.id, username });
+                    io.to(roomHosts[room]).emit("waiting-room-request", { 
+                        socketId: socket.id, 
+                        username,
+                        joinedAt: new Date()
+                    });
                 }
                 socket.emit("waiting-room-status", { message: "Waiting for host to admit you." });
                 if (!shouldTrackParticipant) {
@@ -139,6 +163,7 @@ export const connectToSocket = (server) => {
 
             io.sockets.sockets.get(participantSocketId)?.join(room);
             io.to(participantSocketId).emit("admitted");
+            io.to(participantSocketId).emit("participant-admitted");
             io.to(room).emit("participants-updated", Object.values(roomUsers[room] || {}));
             io.to(room).emit("user-connected", { socketId: participantSocketId, username: participant.username, isHost: false });
             io.to(participantSocketId).emit("participants-updated", Object.values(roomUsers[room] || {}));
@@ -154,6 +179,145 @@ export const connectToSocket = (server) => {
                 }
             });
             io.to(participantSocketId).emit("rejected");
+            io.to(participantSocketId).emit("participant-rejected");
+        });
+
+        // Host control events
+        socket.on("mute-participant", (participantSocketId, roomName) => {
+            const room = normalizePath(roomName);
+            if (roomHosts[room] !== socket.id) return;
+            const participant = roomUsers[room]?.[participantSocketId];
+            if (participant) {
+                participant.canUseMic = false;
+                participant.isAudioOn = false;
+                io.to(room).emit("participants-updated", Object.values(roomUsers[room]));
+                io.to(participantSocketId).emit("participant-muted");
+            }
+        });
+
+        socket.on("allow-mic-participant", (participantSocketId, roomName) => {
+            const room = normalizePath(roomName);
+            if (roomHosts[room] !== socket.id) return;
+            const participant = roomUsers[room]?.[participantSocketId];
+            if (participant) {
+                participant.canUseMic = true;
+                io.to(room).emit("participants-updated", Object.values(roomUsers[room]));
+                io.to(participantSocketId).emit("participant-unmuted");
+            }
+        });
+
+        socket.on("stop-camera-participant", (participantSocketId, roomName) => {
+            const room = normalizePath(roomName);
+            if (roomHosts[room] !== socket.id) return;
+            const participant = roomUsers[room]?.[participantSocketId];
+            if (participant) {
+                participant.canUseCamera = false;
+                participant.isVideoOn = false;
+                io.to(room).emit("participants-updated", Object.values(roomUsers[room]));
+                io.to(participantSocketId).emit("participant-camera-disabled");
+            }
+        });
+
+        socket.on("allow-camera-participant", (participantSocketId, roomName) => {
+            const room = normalizePath(roomName);
+            if (roomHosts[room] !== socket.id) return;
+            const participant = roomUsers[room]?.[participantSocketId];
+            if (participant) {
+                participant.canUseCamera = true;
+                io.to(room).emit("participants-updated", Object.values(roomUsers[room]));
+                io.to(participantSocketId).emit("participant-camera-enabled");
+            }
+        });
+
+        socket.on("mute-all-participants", (roomName) => {
+            const room = normalizePath(roomName);
+            if (roomHosts[room] !== socket.id) return;
+            Object.values(roomUsers[room] || {}).forEach((participant) => {
+                if (participant.socketId === socket.id) return;
+                participant.canUseMic = false;
+                participant.isAudioOn = false;
+                io.to(participant.socketId).emit("participant-muted");
+            });
+            io.to(room).emit("participants-updated", Object.values(roomUsers[room] || {}));
+        });
+
+        socket.on("allow-mic-all-participants", (roomName) => {
+            const room = normalizePath(roomName);
+            if (roomHosts[room] !== socket.id) return;
+            Object.values(roomUsers[room] || {}).forEach((participant) => {
+                if (participant.socketId === socket.id) return;
+                participant.canUseMic = true;
+                io.to(participant.socketId).emit("participant-unmuted");
+            });
+            io.to(room).emit("participants-updated", Object.values(roomUsers[room] || {}));
+        });
+
+        socket.on("stop-camera-all-participants", (roomName) => {
+            const room = normalizePath(roomName);
+            if (roomHosts[room] !== socket.id) return;
+            Object.values(roomUsers[room] || {}).forEach((participant) => {
+                if (participant.socketId === socket.id) return;
+                participant.canUseCamera = false;
+                participant.isVideoOn = false;
+                io.to(participant.socketId).emit("participant-camera-disabled");
+            });
+            io.to(room).emit("participants-updated", Object.values(roomUsers[room] || {}));
+        });
+
+        socket.on("allow-camera-all-participants", (roomName) => {
+            const room = normalizePath(roomName);
+            if (roomHosts[room] !== socket.id) return;
+            Object.values(roomUsers[room] || {}).forEach((participant) => {
+                if (participant.socketId === socket.id) return;
+                participant.canUseCamera = true;
+                io.to(participant.socketId).emit("participant-camera-enabled");
+            });
+            io.to(room).emit("participants-updated", Object.values(roomUsers[room] || {}));
+        });
+
+        // Client media update events
+        socket.on("participant-muted", (roomName) => {
+            const room = normalizePath(roomName);
+            const user = roomUsers[room]?.[socket.id];
+            if (user) {
+                user.isAudioOn = false;
+                io.to(room).emit("participants-updated", Object.values(roomUsers[room]));
+            }
+        });
+
+        socket.on("participant-unmuted", (roomName) => {
+            const room = normalizePath(roomName);
+            const user = roomUsers[room]?.[socket.id];
+            if (user) {
+                if (user.canUseMic !== false) {
+                    user.isAudioOn = true;
+                    io.to(room).emit("participants-updated", Object.values(roomUsers[room]));
+                } else {
+                    socket.emit("participant-muted");
+                }
+            }
+        });
+
+        socket.on("participant-camera-disabled", (roomName) => {
+            const room = normalizePath(roomName);
+            const user = roomUsers[room]?.[socket.id];
+            if (user) {
+                user.isVideoOn = false;
+                io.to(room).emit("participants-updated", Object.values(roomUsers[room]));
+            }
+        });
+
+        socket.on("participant-camera-enabled", (roomName) => {
+            const room = normalizePath(roomName);
+            const user = roomUsers[room]?.[socket.id];
+            if (user) {
+                if (user.canUseCamera !== false) {
+                    user.isVideoOn = true;
+                    io.to(room).emit("participants-updated", Object.values(roomUsers[room]));
+                } else {
+                    socket.emit("participant-camera-disabled");
+                }
+            }
         });
 
         socket.on("offer", (payload) => {
@@ -211,6 +375,7 @@ export const connectToSocket = (server) => {
             const room = normalizePath(roomName);
             if (roomHosts[room] !== socket.id) return;
             io.to(participantSocketId).emit("removed-by-host");
+            io.to(participantSocketId).emit("participant-removed");
         });
 
         socket.on("disconnect", () => {
