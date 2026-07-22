@@ -64,16 +64,7 @@ export const connectToSocket = (server) => {
             const waitingRoom = roomWaiting[room];
 
             userRooms[socket.id] = room;
-            roomState[socket.id] = { 
-                socketId: socket.id, 
-                username, 
-                isHost, 
-                joinedAt: new Date(),
-                isVideoOn: isVideoOn !== undefined ? isVideoOn : true,
-                isAudioOn: isAudioOn !== undefined ? isAudioOn : true,
-                canUseMic: true,
-                canUseCamera: true
-            };
+            roomState[socket.id] = { socketId: socket.id, username, isHost, joinedAt: new Date() };
 
             if (isHost) {
                 roomHosts[room] = socket.id;
@@ -83,11 +74,11 @@ export const connectToSocket = (server) => {
                     username: entry.username,
                     joinedAt: entry.joinedAt || entry.requestedAt || new Date()
                 })));
-                
+
                 const pendingGuests = waitingRoom.filter((entry) => entry.socketId);
                 pendingGuests.forEach((entry) => {
-                    io.to(socket.id).emit("waiting-room-request", { 
-                        socketId: entry.socketId, 
+                    io.to(socket.id).emit("waiting-room-request", {
+                        socketId: entry.socketId,
                         username: entry.username,
                         joinedAt: entry.joinedAt || entry.requestedAt || new Date()
                     });
@@ -104,8 +95,8 @@ export const connectToSocket = (server) => {
                     $set: { waitingRoom: waitingRoom.filter((entry) => entry.socketId !== undefined) }
                 });
                 if (roomHosts[room] && roomHosts[room] !== socket.id) {
-                    io.to(roomHosts[room]).emit("waiting-room-request", { 
-                        socketId: socket.id, 
+                    io.to(roomHosts[room]).emit("waiting-room-request", {
+                        socketId: socket.id,
                         username,
                         joinedAt: new Date()
                     });
@@ -137,6 +128,17 @@ export const connectToSocket = (server) => {
             roomMessages[room].forEach((message) => {
                 socket.emit("chat-message", message.data, message.sender, message.socketId);
             });
+        });
+
+        socket.on("media-state-change", ({ roomName, isVideoOn, isAudioOn }) => {
+            const room = normalizePath(roomName);
+            if (!roomUsers[room]?.[socket.id]) return;
+            roomUsers[room][socket.id] = {
+                ...roomUsers[room][socket.id],
+                isVideoOn: Boolean(isVideoOn),
+                isAudioOn: Boolean(isAudioOn),
+            };
+            io.to(room).emit("participants-updated", Object.values(roomUsers[room] || {}));
         });
 
         socket.on("admit-participant", async (participantSocketId, roomName) => {
