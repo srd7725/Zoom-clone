@@ -43,6 +43,12 @@ const syncMeetingWithSocketState = async (roomName, update) => {
     }
 };
 
+const getActiveParticipants = (roomName) => {
+    const state = roomUsers[roomName] || {};
+    const activeSockets = rooms[roomName] || [];
+    return Object.values(state).filter(user => activeSockets.includes(user.socketId));
+};
+
 export const connectToSocket = (server) => {
     const io = new Server(server, {
         cors: {
@@ -94,8 +100,6 @@ export const connectToSocket = (server) => {
                 });
             }
 
-            const shouldTrackParticipant = isHost || !roomHosts[room] || roomHosts[room] === socket.id;
-
             if (!isHost) {
                 if (!waitingRoom.some((entry) => entry.socketId === socket.id)) {
                     waitingRoom.push({ socketId: socket.id, username, joinedAt: new Date() });
@@ -111,9 +115,7 @@ export const connectToSocket = (server) => {
                     });
                 }
                 socket.emit("waiting-room-status", { message: "Waiting for host to admit you." });
-                if (!shouldTrackParticipant) {
-                    return;
-                }
+                return; // Enforce waiting room logic
             }
 
             if (!roomSockets.includes(socket.id)) {
@@ -125,14 +127,12 @@ export const connectToSocket = (server) => {
                 $set: {
                     waitingRoom: (roomWaiting[room] || []).filter((entry) => entry.socketId !== socket.id)
                 },
-                ...(shouldTrackParticipant ? {
-                    $addToSet: {
-                        participants: { socketId: socket.id, username, joinedAt: new Date() }
-                    }
-                } : {})
+                $addToSet: {
+                    participants: { socketId: socket.id, username, joinedAt: new Date() }
+                }
             });
             io.to(room).emit("user-connected", { socketId: socket.id, username, isHost });
-            io.to(room).emit("participants-updated", Object.values(roomState));
+            io.to(room).emit("participants-updated", getActiveParticipants(room));
 
             roomMessages[room].forEach((message) => {
                 socket.emit("chat-message", message.data, message.sender, message.socketId);
@@ -164,9 +164,14 @@ export const connectToSocket = (server) => {
             io.sockets.sockets.get(participantSocketId)?.join(room);
             io.to(participantSocketId).emit("admitted");
             io.to(participantSocketId).emit("participant-admitted");
-            io.to(room).emit("participants-updated", Object.values(roomUsers[room] || {}));
+            io.to(room).emit("participants-updated", getActiveParticipants(room));
             io.to(room).emit("user-connected", { socketId: participantSocketId, username: participant.username, isHost: false });
-            io.to(participantSocketId).emit("participants-updated", Object.values(roomUsers[room] || {}));
+            
+            // Send existing chat messages to newly admitted user
+            const messages = roomMessages[room] || [];
+            messages.forEach((message) => {
+                io.to(participantSocketId).emit("chat-message", message.data, message.sender, message.socketId);
+            });
         });
 
         socket.on("reject-participant", async (participantSocketId, roomName) => {
@@ -190,7 +195,7 @@ export const connectToSocket = (server) => {
             if (participant) {
                 participant.canUseMic = false;
                 participant.isAudioOn = false;
-                io.to(room).emit("participants-updated", Object.values(roomUsers[room]));
+                io.to(room).emit("participants-updated", getActiveParticipants(room));
                 io.to(participantSocketId).emit("participant-muted");
             }
         });
@@ -201,7 +206,7 @@ export const connectToSocket = (server) => {
             const participant = roomUsers[room]?.[participantSocketId];
             if (participant) {
                 participant.canUseMic = true;
-                io.to(room).emit("participants-updated", Object.values(roomUsers[room]));
+                io.to(room).emit("participants-updated", getActiveParticipants(room));
                 io.to(participantSocketId).emit("participant-unmuted");
             }
         });
@@ -213,7 +218,7 @@ export const connectToSocket = (server) => {
             if (participant) {
                 participant.canUseCamera = false;
                 participant.isVideoOn = false;
-                io.to(room).emit("participants-updated", Object.values(roomUsers[room]));
+                io.to(room).emit("participants-updated", getActiveParticipants(room));
                 io.to(participantSocketId).emit("participant-camera-disabled");
             }
         });
@@ -224,7 +229,7 @@ export const connectToSocket = (server) => {
             const participant = roomUsers[room]?.[participantSocketId];
             if (participant) {
                 participant.canUseCamera = true;
-                io.to(room).emit("participants-updated", Object.values(roomUsers[room]));
+                io.to(room).emit("participants-updated", getActiveParticipants(room));
                 io.to(participantSocketId).emit("participant-camera-enabled");
             }
         });
@@ -238,7 +243,7 @@ export const connectToSocket = (server) => {
                 participant.isAudioOn = false;
                 io.to(participant.socketId).emit("participant-muted");
             });
-            io.to(room).emit("participants-updated", Object.values(roomUsers[room] || {}));
+            io.to(room).emit("participants-updated", getActiveParticipants(room));
         });
 
         socket.on("allow-mic-all-participants", (roomName) => {
@@ -249,7 +254,7 @@ export const connectToSocket = (server) => {
                 participant.canUseMic = true;
                 io.to(participant.socketId).emit("participant-unmuted");
             });
-            io.to(room).emit("participants-updated", Object.values(roomUsers[room] || {}));
+            io.to(room).emit("participants-updated", getActiveParticipants(room));
         });
 
         socket.on("stop-camera-all-participants", (roomName) => {
@@ -261,7 +266,7 @@ export const connectToSocket = (server) => {
                 participant.isVideoOn = false;
                 io.to(participant.socketId).emit("participant-camera-disabled");
             });
-            io.to(room).emit("participants-updated", Object.values(roomUsers[room] || {}));
+            io.to(room).emit("participants-updated", getActiveParticipants(room));
         });
 
         socket.on("allow-camera-all-participants", (roomName) => {
@@ -272,7 +277,7 @@ export const connectToSocket = (server) => {
                 participant.canUseCamera = true;
                 io.to(participant.socketId).emit("participant-camera-enabled");
             });
-            io.to(room).emit("participants-updated", Object.values(roomUsers[room] || {}));
+            io.to(room).emit("participants-updated", getActiveParticipants(room));
         });
 
         // Client media update events
@@ -281,7 +286,7 @@ export const connectToSocket = (server) => {
             const user = roomUsers[room]?.[socket.id];
             if (user) {
                 user.isAudioOn = false;
-                io.to(room).emit("participants-updated", Object.values(roomUsers[room]));
+                io.to(room).emit("participants-updated", getActiveParticipants(room));
             }
         });
 
@@ -291,7 +296,7 @@ export const connectToSocket = (server) => {
             if (user) {
                 if (user.canUseMic !== false) {
                     user.isAudioOn = true;
-                    io.to(room).emit("participants-updated", Object.values(roomUsers[room]));
+                    io.to(room).emit("participants-updated", getActiveParticipants(room));
                 } else {
                     socket.emit("participant-muted");
                 }
@@ -303,7 +308,7 @@ export const connectToSocket = (server) => {
             const user = roomUsers[room]?.[socket.id];
             if (user) {
                 user.isVideoOn = false;
-                io.to(room).emit("participants-updated", Object.values(roomUsers[room]));
+                io.to(room).emit("participants-updated", getActiveParticipants(room));
             }
         });
 
@@ -313,7 +318,7 @@ export const connectToSocket = (server) => {
             if (user) {
                 if (user.canUseCamera !== false) {
                     user.isVideoOn = true;
-                    io.to(room).emit("participants-updated", Object.values(roomUsers[room]));
+                    io.to(room).emit("participants-updated", getActiveParticipants(room));
                 } else {
                     socket.emit("participant-camera-disabled");
                 }
@@ -321,20 +326,26 @@ export const connectToSocket = (server) => {
         });
 
         socket.on("offer", (payload) => {
+            const room = userRooms[socket.id];
+            if (!room || !(rooms[room] || []).includes(socket.id)) return;
             io.to(payload.target).emit("offer", payload);
         });
 
         socket.on("answer", (payload) => {
+            const room = userRooms[socket.id];
+            if (!room || !(rooms[room] || []).includes(socket.id)) return;
             io.to(payload.target).emit("answer", payload);
         });
 
         socket.on("ice-candidate", (payload) => {
+            const room = userRooms[socket.id];
+            if (!room || !(rooms[room] || []).includes(socket.id)) return;
             io.to(payload.target).emit("ice-candidate", payload);
         });
 
         socket.on("chat-message", (data, sender) => {
             const room = userRooms[socket.id];
-            if (!room) return;
+            if (!room || !(rooms[room] || []).includes(socket.id)) return;
             const messageEntry = { data, sender, socketId: socket.id };
             roomMessages[room] = roomMessages[room] || [];
             roomMessages[room].push(messageEntry);
@@ -431,9 +442,10 @@ const handleSocketLeave = async (io, socket, room) => {
 
         await syncMeetingWithSocketState(room, updatePayload);
 
-        io.to(room).emit("participants-updated", Object.values(roomUsers[room] || {}));
+        io.to(room).emit("participants-updated", getActiveParticipants(room));
         io.to(room).emit("user-disconnected", { socketId: socket.id });
     }
 
     delete userRooms[socket.id];
 };
+
