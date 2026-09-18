@@ -23,6 +23,27 @@ const peerConfigConnections = {
     ]
 }
 
+const attachStreamToVideoElement = (videoElement, stream, options = {}) => {
+    const { muted = false, autoPlay = true, playsInline = true } = options;
+    if (!videoElement || !stream) return;
+
+    const hasSameStream = videoElement.srcObject === stream;
+    if (!hasSameStream) {
+        videoElement.srcObject = stream;
+    }
+
+    if (videoElement.muted !== muted) {
+        videoElement.muted = muted;
+    }
+    videoElement.autoplay = autoPlay;
+    videoElement.playsInline = playsInline;
+
+    const playPromise = videoElement.play();
+    if (playPromise?.catch) {
+        playPromise.catch(() => {});
+    }
+};
+
 window.debugStats = window.debugStats || {
     peerConnections: 0,
     rtpSenders: 0,
@@ -38,9 +59,12 @@ const ParticipantTile = React.memo(({ participant }) => {
     const audioRef = useRef(null);
 
     useEffect(() => {
-        if (videoRef.current && participant.stream) {
-            videoRef.current.srcObject = participant.stream;
+        if (videoRef.current && participant.stream && participant.isVideoOn) {
+            attachStreamToVideoElement(videoRef.current, participant.stream, { muted: true });
+        } else if (videoRef.current) {
+            videoRef.current.srcObject = null;
         }
+
         if (audioRef.current && participant.stream) {
             audioRef.current.srcObject = participant.stream;
         }
@@ -96,10 +120,13 @@ export default function VideoMeetComponent() {
     const cameraStreamRef = useRef(null);
     const screenStreamRef = useRef(null);
     const primaryVideoRef = useRef(null);
+    const localLobbyVideoRef = useRef(null);
+    const localWaitingRoomVideoRef = useRef(null);
+    const localMeetingVideoRef = useRef(null);
     const chatInputRef = useRef(null);
+    const chatOpenRef = useRef(true);
     var socketRef = useRef();
     let socketIdRef = useRef();
-    let localVideoref = useRef();
 
     let [videoAvailable, setVideoAvailable] = useState(true);
     let [audioAvailable, setAudioAvailable] = useState(true);
@@ -135,10 +162,8 @@ export default function VideoMeetComponent() {
                 socketRef.current.emit('leave-room', meetingCode);
                 socketRef.current.disconnect();
             }
-            const stream = localVideoref.current?.srcObject;
-            if (stream && typeof stream.getTracks === 'function') {
-                stream.getTracks().forEach((track) => track.stop());
-            }
+            stopMediaStream(cameraStreamRef.current);
+            stopMediaStream(screenStreamRef.current);
             Object.values(peerConnectionsRef.current).forEach(pc => pc.close());
             peerConnectionsRef.current = {};
             Object.values(remoteVideosRef.current).forEach(stream => {
@@ -156,10 +181,20 @@ export default function VideoMeetComponent() {
         }
     };
 
+    const attachLocalStreamToAllLocalVideoElements = (stream = cameraStreamRef.current) => {
+        const localVideoElements = [
+            localLobbyVideoRef.current,
+            localWaitingRoomVideoRef.current,
+            localMeetingVideoRef.current,
+        ].filter(Boolean);
+
+        localVideoElements.forEach((videoElement) => {
+            attachStreamToVideoElement(videoElement, stream, { muted: true });
+        });
+    };
+
     const attachLocalPreview = (stream = cameraStreamRef.current) => {
-        if (localVideoref.current && stream) {
-            localVideoref.current.srcObject = stream;
-        }
+        attachLocalStreamToAllLocalVideoElements(stream);
     };
 
     const validateMeeting = async () => {
@@ -284,9 +319,10 @@ export default function VideoMeetComponent() {
             });
         };
 
-        if (window.localStream) {
+        const localTrackSource = cameraStreamRef.current || window.localStream;
+        if (localTrackSource) {
             console.log('[WEBRTC] Adding local tracks to new peer connection for', remoteSocketId);
-            window.localStream.getTracks().forEach((track) => peerConnection.addTrack(track, window.localStream));
+            localTrackSource.getTracks().forEach((track) => peerConnection.addTrack(track, localTrackSource));
         }
 
         peerConnectionsRef.current[remoteSocketId] = peerConnection;
@@ -311,7 +347,14 @@ export default function VideoMeetComponent() {
 
     const syncLocalStream = (stream, options = {}) => {
         const { shouldPreview = true, isScreenShare = false } = options;
-        window.localStream = stream;
+
+        if (!isScreenShare) {
+            cameraStreamRef.current = stream;
+        }
+
+        const canonicalLocalStream = isScreenShare ? (cameraStreamRef.current || window.localStream || stream) : stream;
+        window.localStream = canonicalLocalStream;
+
         if (shouldPreview && !isScreenShare) {
             attachLocalPreview(stream);
         }
@@ -702,10 +745,8 @@ export default function VideoMeetComponent() {
                     socketRef.current.emit('leave-room', meetingCode);
                 }
             }
-            const stream = localVideoref.current?.srcObject;
-            if (stream && typeof stream.getTracks === 'function') {
-                stream.getTracks().forEach((track) => track.stop());
-            }
+            stopMediaStream(cameraStreamRef.current);
+            stopMediaStream(screenStreamRef.current);
             Object.values(peerConnectionsRef.current).forEach(pc => pc.close());
             peerConnectionsRef.current = {};
             Object.values(remoteVideosRef.current).forEach(stream => {
@@ -723,7 +764,7 @@ export default function VideoMeetComponent() {
             ...prevMessages,
             { sender: sender, data: data }
         ]);
-        if (socketIdSender !== socketIdRef.current) {
+        if (socketIdSender !== socketIdRef.current && !chatOpenRef.current) {
             setNewMessages((prevNewMessages) => prevNewMessages + 1);
         }
     };
@@ -864,8 +905,26 @@ export default function VideoMeetComponent() {
     const canUseMic = localParticipantMetadata?.canUseMic !== false;
     const canUseCamera = localParticipantMetadata?.canUseCamera !== false;
 
+    const remoteParticipants = useMemo(() => {
+        return (participants || [])
+            .filter((participant) => participant.username && participant.socketId && participant.socketId !== socketIdRef.current)
+            .map((participant) => {
+                const matchedStream = videos.find((entry) => entry.socketId === participant.socketId)?.stream;
+                return {
+                    id: participant.socketId || participant.username,
+                    username: participant.username,
+                    isLocal: false,
+                    isHost: participant.isHost === true,
+                    stream: matchedStream || null,
+                    isVideoOn: participant.isVideoOn !== false && Boolean(matchedStream),
+                    isAudioOn: participant.isAudioOn !== false,
+                    isScreenShare: Boolean(matchedStream && participant.isScreenShare),
+                };
+            });
+    }, [participants, videos]);
+
     const meetingParticipants = useMemo(() => {
-        const list = [
+        return [
             {
                 id: 'local',
                 username: username || 'You',
@@ -876,25 +935,9 @@ export default function VideoMeetComponent() {
                 isAudioOn: Boolean(audio && audioAvailable) && (localParticipantMetadata ? localParticipantMetadata.isAudioOn !== false : true),
                 isScreenShare: false,
             },
+            ...remoteParticipants,
         ];
-
-        participants.forEach((participant) => {
-            if (!participant.username || participant.socketId === socketIdRef.current) return;
-            const matchedStream = videos.find((entry) => entry.socketId === participant.socketId)?.stream;
-            list.push({
-                id: participant.socketId || participant.username,
-                username: participant.username,
-                isLocal: false,
-                isHost: participant.isHost === true,
-                stream: matchedStream,
-                isVideoOn: participant.isVideoOn !== false && Boolean(matchedStream),
-                isAudioOn: participant.isAudioOn !== false,
-                isScreenShare: Boolean(matchedStream && participant.isScreenShare),
-            });
-        });
-
-        return list;
-    }, [participants, username, video, videoAvailable, audio, audioAvailable, videos, localParticipantMetadata]);
+    }, [remoteParticipants, username, video, videoAvailable, audio, audioAvailable, localParticipantMetadata, isHost]);
 
     const primaryContentStream = useMemo(() => {
         const sharedStream = videos.find((entry) => entry.isScreenShare)?.stream;
@@ -904,19 +947,20 @@ export default function VideoMeetComponent() {
     }, [videos, isSharingScreen]);
 
     useEffect(() => {
-        if (primaryVideoRef.current && primaryContentStream) {
-            primaryVideoRef.current.srcObject = primaryContentStream;
+        if (primaryContentStream) {
+            attachStreamToVideoElement(primaryVideoRef.current, primaryContentStream);
+        } else {
+            attachStreamToVideoElement(localMeetingVideoRef.current, cameraStreamRef.current);
         }
-    }, [primaryContentStream]);
+    }, [primaryContentStream, askForUsername, inWaitingRoom, video, audio]);
 
     useEffect(() => {
-        if (!primaryContentStream && cameraStreamRef.current) {
-            attachLocalPreview(cameraStreamRef.current);
-        }
-    }, [askForUsername, inWaitingRoom, primaryContentStream, video, audio]);
+        chatOpenRef.current = showModal;
+        if (showModal) setNewMessages(0);
+    }, [showModal]);
 
     const hostParticipant = meetingParticipants.find((participant) => participant.isLocal) || meetingParticipants[0];
-    const attendeeParticipants = meetingParticipants.filter((participant) => !participant.isLocal);
+    const attendeeParticipants = remoteParticipants;
     const visibleAttendees = attendeeParticipants.slice(0, 6);
     const hiddenParticipantCount = Math.max(attendeeParticipants.length - visibleAttendees.length, 0);
     const hasActiveLocalVideo = Boolean(cameraStreamRef.current?.getVideoTracks?.().some((track) => track.readyState === 'live' && track.enabled !== false));
@@ -953,7 +997,7 @@ export default function VideoMeetComponent() {
 
                         <section className="relative h-[420px] w-full overflow-hidden rounded-2xl border border-white/[0.08] bg-slate-950 shadow-2xl" aria-label="Camera preview">
                             {videoAvailable && video !== false ? (
-                                <video ref={localVideoref} autoPlay muted playsInline className="h-full w-full object-cover"></video>
+                                <video ref={localLobbyVideoRef} autoPlay muted playsInline className="h-full w-full object-cover"></video>
                             ) : (
                                 <div className="flex h-full flex-col items-center justify-center px-6 text-center bg-gradient-to-b from-slate-900 to-slate-950">
                                     <span className="mb-4 flex h-20 w-20 items-center justify-center rounded-full bg-white/[0.04] text-slate-400 border border-white/10 shadow-lg">
@@ -1039,7 +1083,7 @@ export default function VideoMeetComponent() {
             inWaitingRoom ?
                 <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', height: '100vh', gap: '20px', background: '#0f0f10', color: 'white' }}>
                     <div style={{ position: 'relative', width: '320px', borderRadius: '16px', overflow: 'hidden', background: '#1a1a2e', border: '1px solid rgba(255,255,255,0.08)' }}>
-                        <video ref={localVideoref} autoPlay muted playsInline style={{ width: '100%', display: 'block' }} />
+                        <video ref={localWaitingRoomVideoRef} autoPlay muted playsInline style={{ width: '100%', display: 'block' }} />
                         {!videoAvailable && (
                             <div style={{ position: 'absolute', inset: 0, display: 'flex', alignItems: 'center', justifyContent: 'center', background: '#1a1a2e' }}>
                                 <VideocamOffIcon style={{ fontSize: 48, color: 'rgba(255,255,255,0.3)' }} />
@@ -1073,7 +1117,7 @@ export default function VideoMeetComponent() {
                                 {screen === true ? <ScreenShareIcon /> : <StopScreenShareIcon />}
                             </IconButton> : <></>}
                         <Badge badgeContent={newMessages} max={999} color='warning'>
-                            <IconButton onClick={() => setModal(!showModal)} style={{ color: "white" }}>
+                            <IconButton onClick={() => setModal((isOpen) => !isOpen)} style={{ color: "white" }}>
                                 <ChatIcon />                        
                             </IconButton>
                         </Badge>
@@ -1090,27 +1134,27 @@ export default function VideoMeetComponent() {
                     </div>
 
                     <div className={styles.meetingMainArea}>
-                        <section className={styles.hostStage}>
-                            <div className={styles.hostVideoCard}>
+                        <section className={styles.meetingStage}>
+                            <div className={styles.meetingVideoCard}>
                                 {primaryContentStream ? (
                                     <video ref={primaryVideoRef} autoPlay playsInline muted className={styles.presentationVideo} />
                                 ) : (
                                     <>
                                         <video
                                             className={styles.meetUserVideo}
-                                            ref={localVideoref}
+                                            ref={localMeetingVideoRef}
                                             autoPlay
                                             muted
                                             playsInline
                                         ></video>
                                         {!hasActiveLocalVideo && (
-                                            <div className={styles.hostAvatar}>
+                                            <div className={styles.meetingAvatar}>
                                                 <span>{hostInitials || 'Y'}</span>
                                             </div>
                                         )}
                                     </>
                                 )}
-                                <div className={styles.hostStatusBar}>
+                                <div className={styles.meetingStatusBar}>
                                     <span>{username || 'You'} {isHost ? '(Host)' : ''}</span>
                                     <div className={styles.statusPills}>
                                         <span className={(hostParticipant?.isAudioOn || hasActiveLocalAudio) ? styles.statusPill : styles.statusPillOff}>
