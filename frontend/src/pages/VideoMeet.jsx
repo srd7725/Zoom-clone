@@ -1,6 +1,6 @@
 import React, { useEffect, useRef, useState, useContext, useMemo } from 'react'
 import io from "socket.io-client";
-import { Badge, IconButton, Button, Dialog, DialogTitle, DialogContent, DialogActions, List, ListItem, ListItemText, Snackbar } from '@mui/material';
+import { Badge, IconButton, Button, Dialog, DialogTitle, DialogContent, DialogActions, List, ListItem, ListItemText, Snackbar, TextField, MenuItem, Select, FormControl, InputLabel } from '@mui/material';
 import VideocamIcon from '@mui/icons-material/Videocam';
 import VideocamOffIcon from '@mui/icons-material/VideocamOff'
 import SettingsIcon from '@mui/icons-material/Settings';
@@ -11,9 +11,12 @@ import ScreenShareIcon from '@mui/icons-material/ScreenShare';
 import StopScreenShareIcon from '@mui/icons-material/StopScreenShare'
 import ChatIcon from '@mui/icons-material/Chat'
 import PeopleIcon from '@mui/icons-material/People'
+import GridViewIcon from '@mui/icons-material/GridView';
+import BrushIcon from '@mui/icons-material/Brush';
 import server from '../environment';
 import { useNavigate, useLocation } from 'react-router-dom';
 import { AuthContext } from '../contexts/AuthContext';
+import CollaborativeWhiteboard from './CollaborativeWhiteboard';
 
 const server_url = server;
 
@@ -72,37 +75,37 @@ const ParticipantTile = React.memo(({ participant }) => {
 
     const initials = (participant.username || 'You').split(' ').map((part) => part[0]).join('').slice(0, 2).toUpperCase();
     const displayName = `${participant.username || 'You'}${participant.isHost ? ' (Host)' : ''}`;
+    const hasVideo = Boolean(participant.stream && participant.isVideoOn);
 
     return (
-        <div className={styles.participantTile} style={{ position: 'relative' }}>
+        <div className={styles.participantTile}>
             {!participant.isLocal && participant.stream && (
                 <audio ref={audioRef} autoPlay playsInline muted={!participant.isAudioOn} />
             )}
-            {participant.stream && participant.isVideoOn ? (
+            {hasVideo ? (
                 <video ref={videoRef} autoPlay playsInline muted className={styles.participantVideo} />
             ) : (
                 <div className={styles.participantAvatar}>
                     <span>{initials || 'U'}</span>
-                    <div className="absolute top-2 right-2 bg-red-500/90 p-1.5 rounded-full text-white flex items-center justify-center shadow-lg border border-red-500/20">
-                        <VideocamOffIcon sx={{ fontSize: 16 }} />
-                    </div>
                 </div>
             )}
-            
-            {/* Status Icons Overlay */}
-            {participant.isVideoOn && !participant.isAudioOn && (
-                <div className="absolute top-2 left-2 bg-red-500/90 p-1.5 rounded-full text-white flex items-center justify-center shadow-lg border border-red-500/20">
-                    <MicOffIcon sx={{ fontSize: 16 }} />
-                </div>
-            )}
-            
-            {!participant.isVideoOn && !participant.isAudioOn && (
-                <div className="absolute top-2 left-2 bg-red-500/90 p-1.5 rounded-full text-white flex items-center justify-center shadow-lg border border-red-500/20">
-                    <MicOffIcon sx={{ fontSize: 16 }} />
-                </div>
-            )}
-
-            <div className={styles.participantLabel}>{displayName}</div>
+            <div className={styles.participantStatus} aria-label="Participant audio and video status">
+                <span
+                    className={participant.isAudioOn ? styles.statusPill : styles.statusPillOff}
+                    title={participant.isAudioOn ? 'Microphone on' : 'Microphone off'}
+                >
+                    {participant.isAudioOn ? <MicIcon sx={{ fontSize: 15 }} /> : <MicOffIcon sx={{ fontSize: 15 }} />}
+                </span>
+                <span
+                    className={hasVideo ? styles.statusPill : styles.statusPillOff}
+                    title={hasVideo ? 'Camera on' : 'Camera off'}
+                >
+                    {hasVideo ? <VideocamIcon sx={{ fontSize: 15 }} /> : <VideocamOffIcon sx={{ fontSize: 15 }} />}
+                </span>
+            </div>
+            <div className={styles.participantLabel}>
+                <span>{displayName}</span>
+            </div>
         </div>
     );
 });
@@ -125,6 +128,10 @@ export default function VideoMeetComponent() {
     const localMeetingVideoRef = useRef(null);
     const chatInputRef = useRef(null);
     const chatOpenRef = useRef(true);
+    const peerRecoveryRef = useRef({});
+    const statsPreviousRef = useRef({});
+    const qualityLastChangedRef = useRef(Date.now());
+    const senderQualityRef = useRef(new WeakMap());
     var socketRef = useRef();
     let socketIdRef = useRef();
 
@@ -154,6 +161,17 @@ export default function VideoMeetComponent() {
     let [usernameError, setUsernameError] = useState("");
     let [previewMessage, setPreviewMessage] = useState("");
     let [isSharingScreen, setIsSharingScreen] = useState(false);
+    const [networkQuality, setNetworkQuality] = useState("Checking");
+    const [activeVideoQuality, setActiveVideoQuality] = useState("Medium");
+    const [videoQualityMode, setVideoQualityMode] = useState("auto");
+    const [qualityWarning, setQualityWarning] = useState("");
+    const [breakoutState, setBreakoutState] = useState({ active: false, rooms: {}, assignments: {} });
+    const [currentBreakoutRoom, setCurrentBreakoutRoom] = useState(null);
+    const [showBreakoutDialog, setShowBreakoutDialog] = useState(false);
+    const [breakoutRoomNames, setBreakoutRoomNames] = useState(["Room 1", "Room 2"]);
+    const [breakoutMode, setBreakoutMode] = useState("auto");
+    const [breakoutAssignments, setBreakoutAssignments] = useState({});
+    const [whiteboardOpen, setWhiteboardOpen] = useState(false);
 
     useEffect(() => {
         validateMeeting();
@@ -166,6 +184,11 @@ export default function VideoMeetComponent() {
             stopMediaStream(screenStreamRef.current);
             Object.values(peerConnectionsRef.current).forEach(pc => pc.close());
             peerConnectionsRef.current = {};
+            Object.values(peerRecoveryRef.current).forEach((recovery) => {
+                clearTimeout(recovery.graceTimer);
+                clearTimeout(recovery.retryTimer);
+            });
+            peerRecoveryRef.current = {};
             Object.values(remoteVideosRef.current).forEach(stream => {
                 if (stream && typeof stream.getTracks === 'function') {
                     stream.getTracks().forEach((track) => track.stop());
@@ -266,6 +289,143 @@ export default function VideoMeetComponent() {
         getUserMedia();
     }, [video, audio, askForUsername, inWaitingRoom])
 
+    const applyVideoQuality = async (quality) => {
+        const settings = {
+            High: { maxBitrate: 1_500_000, maxFramerate: 30, scaleResolutionDownBy: 1 },
+            Medium: { maxBitrate: 700_000, maxFramerate: 24, scaleResolutionDownBy: 1.5 },
+            Low: { maxBitrate: 300_000, maxFramerate: 15, scaleResolutionDownBy: 2.5 },
+        }[quality];
+        if (!settings) return;
+
+        const senders = Object.values(peerConnectionsRef.current)
+            .flatMap((peerConnection) => peerConnection?.getSenders?.() || [])
+            .filter((sender) => sender.track?.kind === "video");
+        await Promise.all(senders.map(async (sender) => {
+            if (senderQualityRef.current.get(sender) === quality) return;
+            const parameters = sender.getParameters();
+            if (!parameters.encodings?.length) {
+                setQualityWarning("Your browser does not expose adjustable video encoding.");
+                return;
+            }
+            parameters.encodings = parameters.encodings.map((encoding) => ({
+                ...encoding,
+                maxBitrate: settings.maxBitrate,
+                maxFramerate: settings.maxFramerate,
+                scaleResolutionDownBy: settings.scaleResolutionDownBy,
+            }));
+            try {
+                await sender.setParameters(parameters);
+                senderQualityRef.current.set(sender, quality);
+                setQualityWarning("");
+            } catch (error) {
+                console.warn("[WEBRTC] Unable to apply outgoing video quality:", error);
+                setQualityWarning("The browser could not apply the selected video quality.");
+            }
+        }));
+    };
+
+    const recoverPeerConnection = async (remoteSocketId) => {
+        const peerConnection = peerConnectionsRef.current[remoteSocketId];
+        const recovery = peerRecoveryRef.current[remoteSocketId];
+        if (!peerConnection || !recovery || recovery.recovering || !socketRef.current?.connected) return;
+        if (
+            ["connected", "completed"].includes(peerConnection.iceConnectionState) &&
+            !["disconnected", "failed"].includes(peerConnection.connectionState)
+        ) return;
+        if (recovery.attempts >= 3) {
+            if (!recovery.failureNotified) {
+                recovery.failureNotified = true;
+                setNetworkQuality("Poor");
+                setSnackMessage("Unable to reconnect to a participant. Check your network and try again.");
+                setSnackOpen(true);
+            }
+            return;
+        }
+
+        clearTimeout(recovery.retryTimer);
+        recovery.retryTimer = null;
+        recovery.recovering = true;
+        recovery.attempts += 1;
+        setNetworkQuality("Reconnecting");
+        try {
+            if (peerConnection.signalingState !== "stable") {
+                throw new Error("Connection is not ready for an ICE restart.");
+            }
+            peerConnection.restartIce?.();
+            const offer = await peerConnection.createOffer({ iceRestart: true });
+            await peerConnection.setLocalDescription(offer);
+            socketRef.current.emit("offer", {
+                target: remoteSocketId,
+                sender: socketIdRef.current,
+                sdp: peerConnection.localDescription,
+                iceRestart: true,
+            });
+        } catch (error) {
+            console.warn(`[WEBRTC] ICE restart attempt ${recovery.attempts} failed for ${remoteSocketId}:`, error);
+        } finally {
+            recovery.recovering = false;
+            const delay = Math.min(12000, 1000 * (2 ** recovery.attempts));
+            recovery.retryTimer = window.setTimeout(() => {
+                const currentConnection = peerConnectionsRef.current[remoteSocketId];
+                if (currentConnection &&
+                    !["connected", "completed"].includes(currentConnection.iceConnectionState) &&
+                    currentConnection.connectionState !== "connected") {
+                    recoverPeerConnection(remoteSocketId);
+                }
+            }, delay);
+        }
+    };
+
+    const monitorPeerConnection = (remoteSocketId, peerConnection) => {
+        const recovery = peerRecoveryRef.current[remoteSocketId];
+        if (!recovery) return;
+        const state = peerConnection.iceConnectionState;
+        const connectionState = peerConnection.connectionState;
+        if (
+            ["connected", "completed"].includes(state) &&
+            !["disconnected", "failed"].includes(connectionState)
+        ) {
+            clearTimeout(recovery.graceTimer);
+            clearTimeout(recovery.retryTimer);
+            recovery.graceTimer = null;
+            recovery.retryTimer = null;
+            recovery.attempts = 0;
+            recovery.recovering = false;
+            recovery.failureNotified = false;
+            setNetworkQuality((current) => current === "Reconnecting" ? "Checking" : current);
+            return;
+        }
+        if (state === "failed" || connectionState === "failed") {
+            clearTimeout(recovery.graceTimer);
+            recoverPeerConnection(remoteSocketId);
+            return;
+        }
+        if ((state === "disconnected" || connectionState === "disconnected") && !recovery.graceTimer && !recovery.recovering) {
+            recovery.graceTimer = window.setTimeout(() => {
+                recovery.graceTimer = null;
+                const currentConnection = peerConnectionsRef.current[remoteSocketId];
+                if (currentConnection &&
+                    (currentConnection.iceConnectionState === "disconnected" || currentConnection.connectionState === "disconnected")) {
+                    recoverPeerConnection(remoteSocketId);
+                }
+            }, 5000);
+        }
+    };
+
+    const closePeerConnection = (remoteSocketId) => {
+        const recovery = peerRecoveryRef.current[remoteSocketId];
+        if (recovery) {
+            clearTimeout(recovery.graceTimer);
+            clearTimeout(recovery.retryTimer);
+            delete peerRecoveryRef.current[remoteSocketId];
+        }
+        peerConnectionsRef.current[remoteSocketId]?.close();
+        delete peerConnectionsRef.current[remoteSocketId];
+        delete statsPreviousRef.current[remoteSocketId];
+        delete remoteVideosRef.current[remoteSocketId];
+        setVideos((previous) => previous.filter((entry) => entry.socketId !== remoteSocketId));
+    };
+
     let getMedia = (initialVideo = videoAvailable, initialAudio = audioAvailable) => {
         setVideo(initialVideo);
         setAudio(initialAudio);
@@ -277,6 +437,15 @@ export default function VideoMeetComponent() {
         if (peerConnectionsRef.current[remoteSocketId]) return peerConnectionsRef.current[remoteSocketId];
 
         const peerConnection = new RTCPeerConnection(peerConfigConnections);
+        peerRecoveryRef.current[remoteSocketId] = {
+            attempts: 0,
+            recovering: false,
+            failureNotified: false,
+            graceTimer: null,
+            retryTimer: null,
+        };
+        peerConnection.oniceconnectionstatechange = () => monitorPeerConnection(remoteSocketId, peerConnection);
+        peerConnection.onconnectionstatechange = () => monitorPeerConnection(remoteSocketId, peerConnection);
         if (window.debugStats) window.debugStats.peerConnections++;
         peerConnection.onicecandidate = (event) => {
             if (event.candidate && socketRef.current) {
@@ -328,6 +497,120 @@ export default function VideoMeetComponent() {
         peerConnectionsRef.current[remoteSocketId] = peerConnection;
         return peerConnection;
     };
+
+    useEffect(() => {
+        let active = true;
+        const sampleConnections = async () => {
+            const peerEntries = Object.entries(peerConnectionsRef.current);
+            if (!peerEntries.length) {
+                if (active) setNetworkQuality("Checking");
+                return;
+            }
+            await applyVideoQuality(videoQualityMode === "auto" ? activeVideoQuality : videoQualityMode);
+
+            const readings = await Promise.all(peerEntries.map(async ([socketId, peerConnection]) => {
+                if (!peerConnection || peerConnection.signalingState === "closed" || typeof peerConnection.getStats !== "function") return null;
+                try {
+                    const reports = await peerConnection.getStats();
+                    let candidatePair;
+                    let inboundVideo;
+                    let outboundVideo;
+                    reports.forEach((report) => {
+                        if (report.type === "candidate-pair" && (report.selected || report.nominated)) {
+                            candidatePair = report;
+                        } else if (report.type === "inbound-rtp" && (report.kind || report.mediaType) === "video" && !report.isRemote) {
+                            inboundVideo = report;
+                        } else if (report.type === "outbound-rtp" && (report.kind || report.mediaType) === "video" && !report.isRemote) {
+                            outboundVideo = report;
+                        }
+                    });
+
+                    const previous = statsPreviousRef.current[socketId];
+                    const now = Date.now();
+                    const bitrate = outboundVideo && previous && now > previous.time
+                        ? Math.max(0, ((outboundVideo.bytesSent - previous.bytesSent) * 8 * 1000) / (now - previous.time))
+                        : candidatePair?.availableOutgoingBitrate;
+                    if (outboundVideo) {
+                        statsPreviousRef.current[socketId] = { bytesSent: outboundVideo.bytesSent, time: now };
+                    }
+                    const packetLoss = inboundVideo && Number.isFinite(inboundVideo.packetsLost)
+                        ? Math.max(0, inboundVideo.packetsLost) /
+                          Math.max(1, (inboundVideo.packetsReceived || 0) + Math.max(0, inboundVideo.packetsLost))
+                        : null;
+                    return {
+                        rtt: candidatePair?.currentRoundTripTime,
+                        bitrate,
+                        packetLoss,
+                        jitter: inboundVideo?.jitter,
+                        iceState: peerConnection.iceConnectionState,
+                        connectionState: peerConnection.connectionState,
+                    };
+                } catch (error) {
+                    console.warn(`[WEBRTC] Unable to read connection statistics for ${socketId}:`, error);
+                    return null;
+                }
+            }));
+            if (!active) return;
+
+            const usableReadings = readings.filter(Boolean);
+            const hasRecovery = Object.values(peerRecoveryRef.current).some((recovery) =>
+                recovery.recovering || recovery.graceTimer || recovery.retryTimer || recovery.failureNotified
+            );
+            const recoveryFailed = Object.values(peerRecoveryRef.current).some((recovery) => recovery.failureNotified);
+            const disconnected = usableReadings.some((reading) =>
+                ["disconnected", "failed"].includes(reading.iceState) ||
+                ["disconnected", "failed"].includes(reading.connectionState)
+            );
+            if (recoveryFailed) {
+                setNetworkQuality("Poor");
+            } else if (hasRecovery || disconnected) {
+                setNetworkQuality("Reconnecting");
+            } else if (!usableReadings.length || !usableReadings.some((reading) =>
+                Number.isFinite(reading.rtt) || Number.isFinite(reading.packetLoss) ||
+                Number.isFinite(reading.jitter) || Number.isFinite(reading.bitrate)
+            )) {
+                setNetworkQuality("Checking");
+            } else {
+                const maxRtt = Math.max(0, ...usableReadings.map((reading) => reading.rtt || 0));
+                const maxLoss = Math.max(0, ...usableReadings.map((reading) => reading.packetLoss || 0));
+                const maxJitter = Math.max(0, ...usableReadings.map((reading) => reading.jitter || 0));
+                const minBitrate = Math.min(...usableReadings
+                    .map((reading) => reading.bitrate)
+                    .filter((bitrate) => Number.isFinite(bitrate) && bitrate > 0), Infinity);
+                const measuredNetwork = maxRtt > 0.5 || maxLoss > 0.08 || maxJitter > 0.04 || minBitrate < 300000
+                    ? "Poor"
+                    : maxRtt > 0.25 || maxLoss > 0.03 || maxJitter > 0.02 || minBitrate < 900000
+                        ? "Fair"
+                        : "Good";
+                setNetworkQuality(measuredNetwork);
+
+                if (videoQualityMode === "auto") {
+                    const target = measuredNetwork === "Poor" ? "Low" : measuredNetwork === "Fair" ? "Medium" : "High";
+                    const rank = { Low: 0, Medium: 1, High: 2 };
+                    const lowering = rank[target] < rank[activeVideoQuality];
+                    const canRaise = Date.now() - qualityLastChangedRef.current >= 20000;
+                    if (lowering || (rank[target] > rank[activeVideoQuality] && canRaise)) {
+                        setActiveVideoQuality(target);
+                        qualityLastChangedRef.current = Date.now();
+                        await applyVideoQuality(target);
+                    }
+                } else {
+                    const target = videoQualityMode;
+                    if (target !== activeVideoQuality) {
+                        setActiveVideoQuality(target);
+                        await applyVideoQuality(target);
+                    }
+                }
+            }
+        };
+
+        sampleConnections();
+        const timer = window.setInterval(sampleConnections, 5000);
+        return () => {
+            active = false;
+            window.clearInterval(timer);
+        };
+    }, [videoQualityMode, activeVideoQuality]);
 
     const createOfferForPeer = async (remoteSocketId) => {
         const peerConnection = ensurePeerConnection(remoteSocketId);
@@ -561,11 +844,17 @@ export default function VideoMeetComponent() {
                 roomName: meetingCode, 
                 username, 
                 isHost,
+                token: localStorage.getItem("token"),
                 isVideoOn: Boolean(initialVideo && videoAvailable),
                 isAudioOn: Boolean(initialAudio && audioAvailable)
             };
-            console.log('[SOCKET] Emitting join-room:', joinPayload);
-            socketRef.current.emit('join-room', joinPayload);
+            console.log('[SOCKET] Joining meeting:', { roomName: meetingCode, isHost });
+            socketRef.current.emit('join-room', joinPayload, (result) => {
+                if (result?.ok === false) {
+                    setMeetingError(result.message || "Unable to join the meeting.");
+                    setAskForUsername(true);
+                }
+            });
         });
 
         socketRef.current.on('chat-message', addMessage);
@@ -662,7 +951,7 @@ export default function VideoMeetComponent() {
                 console.log('[SOCKET] user-connected:', participant.username, participant.socketId);
                 setInWaitingRoom(false);
                 setAskForUsername(false);
-                if (participant.socketId && participant.socketId !== socketIdRef.current) {
+                if (participant.socketId && participant.socketId !== socketIdRef.current && participant.shouldInitiate) {
                     console.log('[WEBRTC] Initiating peer connection + offer to newly connected user:', participant.socketId);
                     ensurePeerConnection(participant.socketId);
                     createOfferForPeer(participant.socketId);
@@ -673,12 +962,25 @@ export default function VideoMeetComponent() {
                 setParticipants(participantsList || []);
             });
 
+            socketRef.current.on('breakout-state', (state) => {
+                setBreakoutState({
+                    active: state?.active === true,
+                    rooms: state?.rooms || {},
+                    assignments: state?.assignments || {},
+                });
+                setBreakoutAssignments(state?.assignments || {});
+            });
+
+            socketRef.current.on('breakout-room-changed', (room) => {
+                Object.keys(peerConnectionsRef.current).forEach(closePeerConnection);
+                setMessages([]);
+                setCurrentBreakoutRoom(room || null);
+                setSnackMessage(room?.name ? `You moved to ${room.name}.` : "You returned to the main meeting.");
+                setSnackOpen(true);
+            });
+
             socketRef.current.on('user-disconnected', ({ socketId }) => {
-                setVideos((prevVideos) => prevVideos.filter((video) => video.socketId !== socketId));
-                if (peerConnectionsRef.current[socketId]) {
-                    peerConnectionsRef.current[socketId].close();
-                    delete peerConnectionsRef.current[socketId];
-                }
+                closePeerConnection(socketId);
             });
     };
 
@@ -878,6 +1180,50 @@ export default function VideoMeetComponent() {
         }
     };
 
+    const createBreakoutRooms = () => {
+        const names = breakoutRoomNames.map((name) => name.trim()).filter(Boolean);
+        const assignments = Object.fromEntries(
+            Object.entries(breakoutAssignments).filter(([, roomId]) => Boolean(roomId))
+        );
+        socketRef.current?.emit("breakout-create", {
+            rooms: names,
+            mode: breakoutMode,
+            assignments,
+        }, (result) => {
+            if (!result?.ok) {
+                setSnackMessage(result?.message || "Unable to create breakout rooms.");
+                setSnackOpen(true);
+                return;
+            }
+            setBreakoutState(result.state);
+            setShowBreakoutDialog(false);
+            setSnackMessage("Breakout rooms are open.");
+            setSnackOpen(true);
+        });
+    };
+
+    const assignParticipantToRoom = (participantId, roomId) => {
+        socketRef.current?.emit("breakout-assign", { socketId: participantId, roomId }, (result) => {
+            if (!result?.ok) {
+                setSnackMessage(result?.message || "Unable to update this assignment.");
+                setSnackOpen(true);
+                return;
+            }
+            setBreakoutState(result.state);
+        });
+    };
+
+    const closeBreakoutRooms = () => {
+        socketRef.current?.emit("breakout-close", meetingCode, (result) => {
+            if (!result?.ok) {
+                setSnackMessage(result?.message || "Unable to close breakout rooms.");
+                setSnackOpen(true);
+                return;
+            }
+            setShowBreakoutDialog(false);
+        });
+    };
+
     useEffect(() => {
         if (!socketIdRef.current) return;
         const me = participants.find(p => p.socketId === socketIdRef.current);
@@ -964,7 +1310,6 @@ export default function VideoMeetComponent() {
     const visibleAttendees = attendeeParticipants.slice(0, 6);
     const hiddenParticipantCount = Math.max(attendeeParticipants.length - visibleAttendees.length, 0);
     const hasActiveLocalVideo = Boolean(cameraStreamRef.current?.getVideoTracks?.().some((track) => track.readyState === 'live' && track.enabled !== false));
-    const hasActiveLocalAudio = Boolean(cameraStreamRef.current?.getAudioTracks?.().some((track) => track.readyState === 'live' && track.enabled !== false));
     const hostInitials = (hostParticipant?.username || username || 'You')
         .split(' ')
         .map((part) => part[0])
@@ -1095,6 +1440,40 @@ export default function VideoMeetComponent() {
                 </div> :
 
                 <div className={styles.meetVideoContainer}>
+                    <header className={styles.meetingTopBar}>
+                        <div className={styles.meetingBrand}>
+                            <span className={styles.brandMark} aria-hidden="true">Z</span>
+                            <span>Zoom Clone</span>
+                        </div>
+                        <div className={styles.meetingInfo}>
+                            <span>Meeting ID</span>
+                            <strong>{meetingCode}</strong>
+                            {currentBreakoutRoom && <strong>{currentBreakoutRoom.name}</strong>}
+                            <span className={styles.networkQuality} data-quality={networkQuality.toLowerCase()}>
+                                Network · {networkQuality}
+                            </span>
+                            <FormControl size="small" className={styles.qualityControl}>
+                                <Select
+                                    value={videoQualityMode}
+                                    onChange={(event) => {
+                                        setVideoQualityMode(event.target.value);
+                                        if (event.target.value !== "auto") {
+                                            setActiveVideoQuality(event.target.value);
+                                            qualityLastChangedRef.current = Date.now();
+                                            applyVideoQuality(event.target.value);
+                                        }
+                                    }}
+                                    inputProps={{ "aria-label": "Outgoing video quality" }}
+                                >
+                                    <MenuItem value="auto">Auto · {activeVideoQuality}</MenuItem>
+                                    <MenuItem value="High">High</MenuItem>
+                                    <MenuItem value="Medium">Medium</MenuItem>
+                                    <MenuItem value="Low">Low</MenuItem>
+                                </Select>
+                            </FormControl>
+                            {qualityWarning && <span className={styles.qualityWarning} title={qualityWarning}>Quality limited</span>}
+                        </div>
+                    </header>
                     <div className={styles.buttonContainers}>
                         <IconButton 
                             onClick={handleVideo} 
@@ -1121,19 +1500,35 @@ export default function VideoMeetComponent() {
                                 <ChatIcon />                        
                             </IconButton>
                         </Badge>
+                        <Badge badgeContent={isHost ? waitingUsers.length : participants.length} color='error'>
+                            <IconButton onClick={() => setShowParticipants(true)} style={{ color: "white" }} title="Participants">
+                                <PeopleIcon />
+                            </IconButton>
+                        </Badge>
                         {isHost && (
-                            <Badge badgeContent={waitingUsers.length} color='error'>
-                                <IconButton onClick={() => setShowParticipants(true)} style={{ color: "white" }}>
-                                    <PeopleIcon />                        
-                                </IconButton>
-                            </Badge>
+                            <IconButton
+                                onClick={() => {
+                                    if (breakoutState.active) {
+                                        setBreakoutRoomNames(Object.values(breakoutState.rooms));
+                                        setBreakoutAssignments(breakoutState.assignments);
+                                    }
+                                    setShowBreakoutDialog(true);
+                                }}
+                                style={{ color: "white" }}
+                                title="Breakout rooms"
+                            >
+                                <GridViewIcon />
+                            </IconButton>
                         )}
+                        <IconButton onClick={() => setWhiteboardOpen(true)} style={{ color: "white" }} title="Open whiteboard">
+                            <BrushIcon />
+                        </IconButton>
                         <Button variant="contained" color="error" onClick={handleEndCall} style={{ marginLeft: '10px' }}>
                             {isHost ? "End Meeting" : "Leave"}
                         </Button>
                     </div>
 
-                    <div className={styles.meetingMainArea}>
+                    <main className={styles.meetingMainArea}>
                         <section className={styles.meetingStage}>
                             <div className={styles.meetingVideoCard}>
                                 {primaryContentStream ? (
@@ -1157,11 +1552,11 @@ export default function VideoMeetComponent() {
                                 <div className={styles.meetingStatusBar}>
                                     <span>{username || 'You'} {isHost ? '(Host)' : ''}</span>
                                     <div className={styles.statusPills}>
-                                        <span className={(hostParticipant?.isAudioOn || hasActiveLocalAudio) ? styles.statusPill : styles.statusPillOff}>
-                                            {(hostParticipant?.isAudioOn || hasActiveLocalAudio) ? <MicIcon sx={{ fontSize: 16 }} /> : <MicOffIcon sx={{ fontSize: 16 }} />}
+                                        <span className={hostParticipant?.isAudioOn ? styles.statusPill : styles.statusPillOff}>
+                                            {hostParticipant?.isAudioOn ? <MicIcon sx={{ fontSize: 16 }} /> : <MicOffIcon sx={{ fontSize: 16 }} />}
                                         </span>
-                                        <span className={(hostParticipant?.isVideoOn || hasActiveLocalVideo) ? styles.statusPill : styles.statusPillOff}>
-                                            {(hostParticipant?.isVideoOn || hasActiveLocalVideo) ? <VideocamIcon sx={{ fontSize: 16 }} /> : <VideocamOffIcon sx={{ fontSize: 16 }} />}
+                                        <span className={hostParticipant?.isVideoOn ? styles.statusPill : styles.statusPillOff}>
+                                            {hostParticipant?.isVideoOn ? <VideocamIcon sx={{ fontSize: 16 }} /> : <VideocamOffIcon sx={{ fontSize: 16 }} />}
                                         </span>
                                     </div>
                                 </div>
@@ -1174,9 +1569,10 @@ export default function VideoMeetComponent() {
                                     <p className={styles.panelEyebrow}>In meeting</p>
                                     <h2>Participants</h2>
                                 </div>
-                                {hiddenParticipantCount > 0 && (
-                                    <span className={styles.viewMoreBadge}>+{hiddenParticipantCount} more</span>
-                                )}
+                                <div className={styles.participantCount}>
+                                    <span>{meetingParticipants.length}</span>
+                                    {hiddenParticipantCount > 0 && <span>+{hiddenParticipantCount} more</span>}
+                                </div>
                             </div>
 
                             <div className={styles.participantGrid}>
@@ -1186,7 +1582,7 @@ export default function VideoMeetComponent() {
                                 {visibleAttendees.length === 0 && (
                                     <div className={styles.emptyParticipants}>
                                         <PeopleIcon />
-                                        <p>No participants yet</p>
+                                        <p>No other participants yet</p>
                                     </div>
                                 )}
                             </div>
@@ -1198,7 +1594,7 @@ export default function VideoMeetComponent() {
                                             <p className={styles.panelEyebrow}>Live room</p>
                                             <h2>Chat</h2>
                                         </div>
-                                        <span>{messages.length}</span>
+                                        <span aria-label={`${messages.length} messages`}>{messages.length}</span>
                                     </div>
                                     <div className={styles.chattingDisplay}>
                                         {messages.length !== 0 ? messages.map((item, index) => (
@@ -1216,13 +1612,14 @@ export default function VideoMeetComponent() {
                                             onKeyDown={handleChatKeyDown}
                                             placeholder="Enter your chat"
                                             className={styles.chatInput}
+                                            aria-label="Chat message"
                                         />
                                         <button type="button" className={styles.sendButton} onClick={sendMessage}>Send</button>
                                     </div>
                                 </div>
                             )}
                         </aside>
-                    </div>
+                    </main>
                     
                     {/* Participants Modal for Host */}
                     <Dialog open={showParticipants} onClose={() => setShowParticipants(false)} fullWidth maxWidth="sm">
@@ -1307,6 +1704,93 @@ export default function VideoMeetComponent() {
                             <Button onClick={() => setShowParticipants(false)}>Close</Button>
                         </DialogActions>
                     </Dialog>
+
+                    <Dialog open={showBreakoutDialog} onClose={() => setShowBreakoutDialog(false)} fullWidth maxWidth="sm">
+                        <DialogTitle>{breakoutState.active ? "Manage breakout rooms" : "Create breakout rooms"}</DialogTitle>
+                        <DialogContent>
+                            {!breakoutState.active && (
+                                <>
+                                    {breakoutRoomNames.map((roomName, index) => (
+                                        <div key={`breakout-${index}`} style={{ display: "flex", gap: "8px", alignItems: "center", marginTop: "10px" }}>
+                                            <TextField
+                                                fullWidth
+                                                size="small"
+                                                label={`Room ${index + 1} name`}
+                                                value={roomName}
+                                                onChange={(event) => setBreakoutRoomNames((previous) =>
+                                                    previous.map((name, roomIndex) => roomIndex === index ? event.target.value : name)
+                                                )}
+                                            />
+                                            {breakoutRoomNames.length > 2 && (
+                                                <Button onClick={() => setBreakoutRoomNames((previous) => previous.filter((_, roomIndex) => roomIndex !== index))}>
+                                                    Remove
+                                                </Button>
+                                            )}
+                                        </div>
+                                    ))}
+                                    {breakoutRoomNames.length < 8 && (
+                                        <Button
+                                            sx={{ mt: 1 }}
+                                            onClick={() => setBreakoutRoomNames((previous) => [...previous, `Room ${previous.length + 1}`])}
+                                        >
+                                            Add room
+                                        </Button>
+                                    )}
+                                    <FormControl fullWidth size="small" sx={{ mt: 2 }}>
+                                        <InputLabel id="breakout-assignment-mode">Assignment</InputLabel>
+                                        <Select
+                                            labelId="breakout-assignment-mode"
+                                            value={breakoutMode}
+                                            label="Assignment"
+                                            onChange={(event) => setBreakoutMode(event.target.value)}
+                                        >
+                                            <MenuItem value="auto">Assign participants automatically</MenuItem>
+                                            <MenuItem value="manual">Assign participants manually</MenuItem>
+                                        </Select>
+                                    </FormControl>
+                                </>
+                            )}
+                            {(breakoutMode === "manual" || breakoutState.active) && (
+                                <div style={{ display: "grid", gap: "10px", marginTop: "16px" }}>
+                                    {participants.filter((participant) => participant.username && !participant.isHost).map((participant) => (
+                                        <TextField
+                                            key={participant.socketId}
+                                            select
+                                            fullWidth
+                                            size="small"
+                                            label={participant.username}
+                                            value={breakoutAssignments[participant.socketId] || ""}
+                                            onChange={(event) => {
+                                                const roomId = event.target.value;
+                                                setBreakoutAssignments((previous) => ({ ...previous, [participant.socketId]: roomId }));
+                                                if (breakoutState.active) assignParticipantToRoom(participant.socketId, roomId);
+                                            }}
+                                        >
+                                            <MenuItem value="">Keep in main meeting</MenuItem>
+                                            {(breakoutState.active ? Object.entries(breakoutState.rooms) : breakoutRoomNames.map((name, index) => [`room-${index + 1}`, name]))
+                                                .map(([roomId, roomName]) => (
+                                                    <MenuItem key={roomId} value={roomId}>{roomName}</MenuItem>
+                                                ))}
+                                        </TextField>
+                                    ))}
+                                </div>
+                            )}
+                        </DialogContent>
+                        <DialogActions>
+                            <Button onClick={() => setShowBreakoutDialog(false)}>Cancel</Button>
+                            {breakoutState.active ? (
+                                <Button color="error" onClick={closeBreakoutRooms}>Return everyone</Button>
+                            ) : (
+                                <Button variant="contained" onClick={createBreakoutRooms}>Start rooms</Button>
+                            )}
+                        </DialogActions>
+                    </Dialog>
+
+                    <CollaborativeWhiteboard
+                        socket={socketRef.current}
+                        open={whiteboardOpen}
+                        onClose={() => setWhiteboardOpen(false)}
+                    />
                     
                     <Snackbar
                         open={snackOpen}

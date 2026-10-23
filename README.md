@@ -56,6 +56,15 @@ A production-ready **Zoom Clone** built using the **MERN Stack**, **WebRTC**, an
 - Allow/Deny Microphone
 - End Meeting For Everyone
 
+### 🧩 Network and Collaboration
+- Per-peer WebRTC connection health monitoring and bounded ICE-restart recovery
+- Network quality indicator and Auto/High/Medium/Low outgoing video encoding targets
+- Host-managed breakout rooms with automatic or manual assignment
+- Room-scoped participant lists, chat, WebRTC signaling, and whiteboards
+- Collaborative whiteboard with pen, eraser, color, brush size, undo, redo, and clear
+
+Breakout-room assignments and whiteboard history are held in server memory and are lost when the backend restarts. Video quality settings are best-effort sender targets; browser/device support and available WebRTC statistics vary. The app uses peer-to-peer mesh connections, so connection and media load grows with the number of participants.
+
 ### 🎨 User Interface
 - Zoom Inspired Interface
 - Responsive Design
@@ -261,6 +270,10 @@ Leave Meeting
 - Lobby System
 - Meeting Validation
 - Chat
+- Network recovery
+- Adaptive video quality
+- Breakout rooms
+- Collaborative whiteboard
 - Responsive UI
 - MERN Stack
 - WebRTC
@@ -300,9 +313,7 @@ _Add screenshot here_
 - Virtual Background
 - Raise Hand
 - Emoji Reactions
-- Whiteboard
 - File Sharing
-- Breakout Rooms
 - Calendar Integration
 - Live Captions
 - Meeting History
