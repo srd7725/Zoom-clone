@@ -26,14 +26,30 @@ const peerConfigConnections = {
     ]
 }
 
+// Thresholds use WebRTC RTT/jitter seconds converted to milliseconds and interval packet loss.
+const NETWORK_QUALITY_THRESHOLDS = {
+    rttFairMs: 250,
+    rttPoorMs: 500,
+    packetLossFair: 0.03,
+    packetLossPoor: 0.08,
+    jitterFairMs: 20,
+    jitterPoorMs: 40,
+    availableBitrateFair: 900_000,
+    availableBitratePoor: 300_000,
+    unavailableAfterMs: 15_000,
+    degradedSamplesRequired: 2,
+    healthySamplesRequired: 3,
+};
+
 const attachStreamToVideoElement = (videoElement, stream, options = {}) => {
     const { muted = false, autoPlay = true, playsInline = true } = options;
-    if (!videoElement || !stream) return;
+    if (!videoElement) return;
 
     const hasSameStream = videoElement.srcObject === stream;
     if (!hasSameStream) {
         videoElement.srcObject = stream;
     }
+    if (!stream) return;
 
     if (videoElement.muted !== muted) {
         videoElement.muted = muted;
@@ -44,6 +60,32 @@ const attachStreamToVideoElement = (videoElement, stream, options = {}) => {
     const playPromise = videoElement.play();
     if (playPromise?.catch) {
         playPromise.catch(() => {});
+    }
+};
+
+const getSenderForTrackKind = (peerConnection, kind) => {
+    const transceiver = peerConnection.getTransceivers().find((entry) =>
+        !entry.stopped && entry.receiver.track.kind === kind
+    );
+    return transceiver
+        ? { sender: transceiver.sender, transceiver }
+        : { sender: peerConnection.getSenders().find((sender) => sender.track?.kind === kind), transceiver: null };
+};
+
+const getMediaWithAudioProcessingFallback = async (constraints) => {
+    try {
+        return await navigator.mediaDevices.getUserMedia(constraints);
+    } catch (error) {
+        const audioConstraints = constraints.audio;
+        const audioConstraintFailure = error?.name === 'OverconstrainedError' &&
+            audioConstraints && typeof audioConstraints === 'object' &&
+            ['echoCancellation', 'noiseSuppression', 'autoGainControl'].includes(error.constraint);
+        if (!audioConstraintFailure) throw error;
+
+        console.warn('[MEDIA] Browser rejected an audio-processing constraint; retrying with default audio processing.', {
+            constraint: error.constraint,
+        });
+        return navigator.mediaDevices.getUserMedia({ ...constraints, audio: true });
     }
 };
 
@@ -60,31 +102,106 @@ window.debugStats = window.debugStats || {
 const ParticipantTile = React.memo(({ participant }) => {
     const videoRef = useRef(null);
     const audioRef = useRef(null);
+    const [playbackError, setPlaybackError] = useState(false);
+    const [hasVideoFrame, setHasVideoFrame] = useState(false);
+    const hasVideoTrack = Boolean(participant.stream && participant.isVideoOn);
+    const audioTrackKey = participant.stream?.getAudioTracks?.().map((track) => track.id).join(',') || '';
 
     useEffect(() => {
-        if (videoRef.current && participant.stream && participant.isVideoOn) {
-            attachStreamToVideoElement(videoRef.current, participant.stream, { muted: true });
-        } else if (videoRef.current) {
-            videoRef.current.srcObject = null;
+        const videoElement = videoRef.current;
+        if (videoElement && participant.stream && hasVideoTrack) {
+            videoElement.srcObject = participant.stream;
+            // Remote audio is played by the separate audio element below; keep the
+            // video element muted to avoid playing the same audio twice.
+            videoElement.muted = true;
+            videoElement.autoplay = true;
+            videoElement.playsInline = true;
+            setPlaybackError(false);
+            setHasVideoFrame(false);
+            videoElement.play()?.catch(() => setPlaybackError(true));
+        } else if (videoElement) {
+            videoElement.srcObject = null;
         }
 
-        if (audioRef.current && participant.stream) {
-            audioRef.current.srcObject = participant.stream;
+        return () => {
+            if (videoElement) videoElement.srcObject = null;
+        };
+    }, [participant.stream, hasVideoTrack]);
+
+    useEffect(() => {
+        const audioElement = audioRef.current;
+        const audioTracks = participant.stream?.getAudioTracks?.() || [];
+        if (!participant.isLocal && audioElement && audioTracks.length) {
+            const audioOnlyStream = new MediaStream(audioTracks);
+            audioElement.srcObject = audioOnlyStream;
+            audioElement.play()?.catch((error) => {
+                console.warn('[AUDIO] Remote audio playback was blocked or failed.', {
+                    participantId: participant.id,
+                    errorName: error?.name,
+                });
+            });
+        } else if (audioElement) {
+            audioElement.srcObject = null;
         }
-    }, [participant.stream, participant.isVideoOn]);
+
+        return () => {
+            if (audioElement) {
+                audioElement.pause();
+                audioElement.srcObject = null;
+            }
+        };
+    }, [participant.stream, audioTrackKey, participant.isLocal, participant.id]);
 
     const initials = (participant.username || 'You').split(' ').map((part) => part[0]).join('').slice(0, 2).toUpperCase();
     const displayName = `${participant.username || 'You'}${participant.isHost ? ' (Host)' : ''}`;
-    const hasVideo = Boolean(participant.stream && participant.isVideoOn);
+    const hasVideo = hasVideoTrack && hasVideoFrame && !playbackError;
+    const videoStatus = participant.isCameraEnabled === false
+        ? 'Camera off'
+        : playbackError
+            ? 'Video playback blocked'
+            : hasVideo
+                ? 'Video receiving'
+                : hasVideoTrack
+                    ? 'Video track received; waiting for frames'
+                    : participant.connectionState === 'failed'
+                        ? 'Connection failed'
+                        : participant.connectionState === 'disconnected'
+                            ? 'Connection interrupted; reconnecting'
+                            : participant.connectionState === 'connected'
+                                ? 'Connected; no video track received'
+                                : 'Connecting; waiting for video track';
 
     return (
         <div className={styles.participantTile}>
-            {!participant.isLocal && participant.stream && (
+            {!participant.isLocal && participant.stream?.getAudioTracks?.().length > 0 && (
                 <audio ref={audioRef} autoPlay playsInline muted={!participant.isAudioOn} />
             )}
-            {hasVideo ? (
-                <video ref={videoRef} autoPlay playsInline muted className={styles.participantVideo} />
-            ) : (
+            {hasVideoTrack && (
+                <video
+                    ref={videoRef}
+                    autoPlay playsInline muted
+                    onLoadedData={(event) => {
+                        setHasVideoFrame(true);
+                        console.info("[MEDIA_DIAG] Remote video element received frame data", {
+                            participantId: participant.id,
+                            trackIds: participant.stream?.getVideoTracks?.().map((track) => track.id) || [],
+                            videoWidth: event.currentTarget.videoWidth,
+                            videoHeight: event.currentTarget.videoHeight,
+                            readyState: event.currentTarget.readyState,
+                        });
+                    }}
+                    onPlaying={(event) => {
+                        setHasVideoFrame(true);
+                        console.info("[MEDIA_DIAG] Remote video playback started", {
+                            participantId: participant.id,
+                            videoWidth: event.currentTarget.videoWidth,
+                            videoHeight: event.currentTarget.videoHeight,
+                        });
+                    }}
+                    className={styles.participantVideo}
+                />
+            )}
+            {!hasVideoTrack && (
                 <div className={styles.participantAvatar}>
                     <span>{initials || 'U'}</span>
                 </div>
@@ -98,7 +215,8 @@ const ParticipantTile = React.memo(({ participant }) => {
                 </span>
                 <span
                     className={hasVideo ? styles.statusPill : styles.statusPillOff}
-                    title={hasVideo ? 'Camera on' : 'Camera off'}
+                    title={videoStatus}
+                    aria-label={videoStatus}
                 >
                     {hasVideo ? <VideocamIcon sx={{ fontSize: 15 }} /> : <VideocamOffIcon sx={{ fontSize: 15 }} />}
                 </span>
@@ -120,8 +238,11 @@ export default function VideoMeetComponent() {
 
     const peerConnectionsRef = useRef({});
     const remoteVideosRef = useRef({});
+    const pendingNegotiationRef = useRef({});
+    const makingOfferRef = useRef({});
     const cameraStreamRef = useRef(null);
     const screenStreamRef = useRef(null);
+    const pendingIceCandidatesRef = useRef({});
     const primaryVideoRef = useRef(null);
     const localLobbyVideoRef = useRef(null);
     const localWaitingRoomVideoRef = useRef(null);
@@ -130,6 +251,14 @@ export default function VideoMeetComponent() {
     const chatOpenRef = useRef(true);
     const peerRecoveryRef = useRef({});
     const statsPreviousRef = useRef({});
+    const statsPollInFlightRef = useRef(false);
+    const networkAssessmentRef = useRef({
+        startedAt: Date.now(),
+        stableQuality: "Checking",
+        candidateQuality: null,
+        candidateCount: 0,
+        previousPeerStats: {},
+    });
     const qualityLastChangedRef = useRef(Date.now());
     const senderQualityRef = useRef(new WeakMap());
     var socketRef = useRef();
@@ -137,6 +266,8 @@ export default function VideoMeetComponent() {
 
     let [videoAvailable, setVideoAvailable] = useState(true);
     let [audioAvailable, setAudioAvailable] = useState(true);
+    const [localStream, setLocalStream] = useState(null);
+    const [peerStates, setPeerStates] = useState({});
     let [video, setVideo] = useState(false);
     let [audio, setAudio] = useState(false);
     let [screen, setScreen] = useState();
@@ -162,6 +293,7 @@ export default function VideoMeetComponent() {
     let [previewMessage, setPreviewMessage] = useState("");
     let [isSharingScreen, setIsSharingScreen] = useState(false);
     const [networkQuality, setNetworkQuality] = useState("Checking");
+    const [networkQualityDetails, setNetworkQualityDetails] = useState("Waiting for WebRTC connection measurements.");
     const [activeVideoQuality, setActiveVideoQuality] = useState("Medium");
     const [videoQualityMode, setVideoQualityMode] = useState("auto");
     const [qualityWarning, setQualityWarning] = useState("");
@@ -195,6 +327,7 @@ export default function VideoMeetComponent() {
                 }
             });
             remoteVideosRef.current = {};
+            pendingIceCandidatesRef.current = {};
         };
     }, []);
 
@@ -245,7 +378,7 @@ export default function VideoMeetComponent() {
     const getPermissions = async () => {
         console.log('[MEDIA] getPermissions() called — requesting camera/mic permission...');
         try {
-            const stream = await navigator.mediaDevices.getUserMedia({ 
+            const stream = await getMediaWithAudioProcessingFallback({
                 video: true, 
                 audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } 
             }).catch((error) => {
@@ -300,34 +433,70 @@ export default function VideoMeetComponent() {
         const senders = Object.values(peerConnectionsRef.current)
             .flatMap((peerConnection) => peerConnection?.getSenders?.() || [])
             .filter((sender) => sender.track?.kind === "video");
-        await Promise.all(senders.map(async (sender) => {
-            if (senderQualityRef.current.get(sender) === quality) return;
-            const parameters = sender.getParameters();
-            if (!parameters.encodings?.length) {
-                setQualityWarning("Your browser does not expose adjustable video encoding.");
-                return;
-            }
-            parameters.encodings = parameters.encodings.map((encoding) => ({
-                ...encoding,
-                maxBitrate: settings.maxBitrate,
-                maxFramerate: settings.maxFramerate,
-                scaleResolutionDownBy: settings.scaleResolutionDownBy,
-            }));
+        if (!senders.length) {
+            setQualityWarning("Video quality cannot be applied until a local video sender is active.");
+            return false;
+        }
+
+        const results = await Promise.all(senders.map(async (sender) => {
+            if (senderQualityRef.current.get(sender) === quality) return true;
             try {
+                const parameters = sender.getParameters();
+                if (!parameters.encodings?.length) {
+                    setQualityWarning("Your browser does not expose adjustable video encoding.");
+                    return false;
+                }
+                parameters.encodings = parameters.encodings.map((encoding) => {
+                    const updatedEncoding = { ...encoding };
+                    if ("maxBitrate" in encoding || encoding.maxBitrate === undefined) {
+                        updatedEncoding.maxBitrate = settings.maxBitrate;
+                    }
+                    if ("maxFramerate" in encoding || encoding.maxFramerate === undefined) {
+                        updatedEncoding.maxFramerate = settings.maxFramerate;
+                    }
+                    if ("scaleResolutionDownBy" in encoding || encoding.scaleResolutionDownBy === undefined) {
+                        updatedEncoding.scaleResolutionDownBy = settings.scaleResolutionDownBy;
+                    }
+                    return updatedEncoding;
+                });
                 await sender.setParameters(parameters);
                 senderQualityRef.current.set(sender, quality);
-                setQualityWarning("");
+                const appliedParameters = sender.getParameters();
+                console.info("[WEBRTC_DIAG] Applied outgoing video encoding", {
+                    peerId: Object.entries(peerConnectionsRef.current)
+                        .find(([, peerConnection]) => peerConnection.getSenders().includes(sender))?.[0],
+                    quality,
+                    encodings: appliedParameters.encodings?.map(({ maxBitrate, maxFramerate, scaleResolutionDownBy }) => ({
+                        maxBitrate,
+                        maxFramerate,
+                        scaleResolutionDownBy,
+                    })),
+                });
+                return true;
             } catch (error) {
                 console.warn("[WEBRTC] Unable to apply outgoing video quality:", error);
                 setQualityWarning("The browser could not apply the selected video quality.");
+                return false;
             }
         }));
+        const allApplied = results.every(Boolean);
+        if (allApplied) setQualityWarning("");
+        return allApplied;
     };
 
     const recoverPeerConnection = async (remoteSocketId) => {
         const peerConnection = peerConnectionsRef.current[remoteSocketId];
         const recovery = peerRecoveryRef.current[remoteSocketId];
         if (!peerConnection || !recovery || recovery.recovering || !socketRef.current?.connected) return;
+        if (makingOfferRef.current[remoteSocketId]) {
+            if (!recovery.retryTimer) {
+                recovery.retryTimer = window.setTimeout(() => {
+                    recovery.retryTimer = null;
+                    recoverPeerConnection(remoteSocketId);
+                }, 1000);
+            }
+            return;
+        }
         if (
             ["connected", "completed"].includes(peerConnection.iceConnectionState) &&
             !["disconnected", "failed"].includes(peerConnection.connectionState)
@@ -347,6 +516,7 @@ export default function VideoMeetComponent() {
         recovery.recovering = true;
         recovery.attempts += 1;
         setNetworkQuality("Reconnecting");
+        makingOfferRef.current[remoteSocketId] = true;
         try {
             if (peerConnection.signalingState !== "stable") {
                 throw new Error("Connection is not ready for an ICE restart.");
@@ -363,7 +533,10 @@ export default function VideoMeetComponent() {
         } catch (error) {
             console.warn(`[WEBRTC] ICE restart attempt ${recovery.attempts} failed for ${remoteSocketId}:`, error);
         } finally {
+            makingOfferRef.current[remoteSocketId] = false;
             recovery.recovering = false;
+            if (peerRecoveryRef.current[remoteSocketId] !== recovery ||
+                peerConnectionsRef.current[remoteSocketId] !== peerConnection) return;
             const delay = Math.min(12000, 1000 * (2 ** recovery.attempts));
             recovery.retryTimer = window.setTimeout(() => {
                 const currentConnection = peerConnectionsRef.current[remoteSocketId];
@@ -420,10 +593,29 @@ export default function VideoMeetComponent() {
             delete peerRecoveryRef.current[remoteSocketId];
         }
         peerConnectionsRef.current[remoteSocketId]?.close();
+        remoteVideosRef.current[remoteSocketId]?.getTracks?.().forEach((track) => track.stop());
         delete peerConnectionsRef.current[remoteSocketId];
+        delete pendingNegotiationRef.current[remoteSocketId];
+        delete makingOfferRef.current[remoteSocketId];
         delete statsPreviousRef.current[remoteSocketId];
+        delete networkAssessmentRef.current.previousPeerStats[remoteSocketId];
         delete remoteVideosRef.current[remoteSocketId];
+        delete pendingIceCandidatesRef.current[remoteSocketId];
+        setPeerStates((previous) => {
+            const next = { ...previous };
+            delete next[remoteSocketId];
+            return next;
+        });
         setVideos((previous) => previous.filter((entry) => entry.socketId !== remoteSocketId));
+        if (!Object.keys(peerConnectionsRef.current).length) {
+            networkAssessmentRef.current.startedAt = Date.now();
+            networkAssessmentRef.current.lastValidAt = undefined;
+            networkAssessmentRef.current.stableQuality = "Checking";
+            networkAssessmentRef.current.candidateQuality = null;
+            networkAssessmentRef.current.candidateCount = 0;
+            setNetworkQuality("Checking");
+            setNetworkQualityDetails("Waiting for WebRTC connection measurements.");
+        }
     };
 
     let getMedia = (initialVideo = videoAvailable, initialAudio = audioAvailable) => {
@@ -434,9 +626,31 @@ export default function VideoMeetComponent() {
 
     const ensurePeerConnection = (remoteSocketId) => {
         if (!remoteSocketId || remoteSocketId === socketIdRef.current) return null;
-        if (peerConnectionsRef.current[remoteSocketId]) return peerConnectionsRef.current[remoteSocketId];
+        if (peerConnectionsRef.current[remoteSocketId]) {
+            console.debug("[WEBRTC_DIAG] Reusing peer connection", {
+                meetingId: meetingCode,
+                localParticipantId: socketIdRef.current,
+                remoteParticipantId: remoteSocketId,
+                signalingState: peerConnectionsRef.current[remoteSocketId].signalingState,
+                connectionState: peerConnectionsRef.current[remoteSocketId].connectionState,
+            });
+            return peerConnectionsRef.current[remoteSocketId];
+        }
 
+        if (!Object.keys(peerConnectionsRef.current).length) {
+            networkAssessmentRef.current.startedAt = Date.now();
+            networkAssessmentRef.current.lastValidAt = undefined;
+            networkAssessmentRef.current.stableQuality = "Checking";
+            networkAssessmentRef.current.candidateQuality = null;
+            networkAssessmentRef.current.candidateCount = 0;
+        }
         const peerConnection = new RTCPeerConnection(peerConfigConnections);
+        console.info("[WEBRTC_DIAG] Created peer connection", {
+            meetingId: meetingCode,
+            localParticipantId: socketIdRef.current,
+            remoteParticipantId: remoteSocketId,
+            peerConnectionCount: Object.keys(peerConnectionsRef.current).length + 1,
+        });
         peerRecoveryRef.current[remoteSocketId] = {
             attempts: 0,
             recovering: false,
@@ -444,54 +658,149 @@ export default function VideoMeetComponent() {
             graceTimer: null,
             retryTimer: null,
         };
-        peerConnection.oniceconnectionstatechange = () => monitorPeerConnection(remoteSocketId, peerConnection);
-        peerConnection.onconnectionstatechange = () => monitorPeerConnection(remoteSocketId, peerConnection);
+        const updatePeerConnectionState = () => {
+            const reportedState = ["failed", "disconnected"].includes(peerConnection.iceConnectionState)
+                ? peerConnection.iceConnectionState
+                : peerConnection.connectionState;
+            setPeerStates((previous) => ({ ...previous, [remoteSocketId]: reportedState }));
+            console.info("[WEBRTC_DIAG] Peer state changed", {
+                meetingId: meetingCode,
+                localParticipantId: socketIdRef.current,
+                remoteParticipantId: remoteSocketId,
+                signalingState: peerConnection.signalingState,
+                connectionState: peerConnection.connectionState,
+                iceConnectionState: peerConnection.iceConnectionState,
+            });
+            monitorPeerConnection(remoteSocketId, peerConnection);
+        };
+        peerConnection.oniceconnectionstatechange = updatePeerConnectionState;
+        peerConnection.onconnectionstatechange = () => {
+            updatePeerConnectionState();
+        };
+        peerConnection.onsignalingstatechange = () => {
+            console.info("[WEBRTC_DIAG] Signaling state changed", {
+                meetingId: meetingCode,
+                localParticipantId: socketIdRef.current,
+                remoteParticipantId: remoteSocketId,
+                signalingState: peerConnection.signalingState,
+                connectionState: peerConnection.connectionState,
+                iceConnectionState: peerConnection.iceConnectionState,
+            });
+        };
         if (window.debugStats) window.debugStats.peerConnections++;
         peerConnection.onicecandidate = (event) => {
             if (event.candidate && socketRef.current) {
-                console.log('[ICE] Sending ICE candidate to', remoteSocketId);
+                console.debug('[WEBRTC_DIAG] ICE candidate', {
+                    meetingId: meetingCode,
+                    localId: socketIdRef.current,
+                    remoteId: remoteSocketId,
+                    candidateType: event.candidate.type,
+                    signalingState: peerConnection.signalingState,
+                    iceConnectionState: peerConnection.iceConnectionState,
+                });
                 socketRef.current.emit('ice-candidate', { target: remoteSocketId, sender: socketIdRef.current, candidate: event.candidate });
             }
+        };
+        peerConnection.onicecandidateerror = (event) => {
+            console.warn("[WEBRTC_DIAG] ICE candidate gathering error", {
+                meetingId: meetingCode,
+                localParticipantId: socketIdRef.current,
+                remoteParticipantId: remoteSocketId,
+                errorCode: event.errorCode,
+                errorText: event.errorText,
+                signalingState: peerConnection.signalingState,
+                iceGatheringState: peerConnection.iceGatheringState,
+            });
         };
 
         peerConnection.ontrack = (event) => {
             if (window.debugStats) window.debugStats.ontrack++;
-            console.log('[AUDIO_DEBUG] [WEBRTC] ontrack() fired — received track from', remoteSocketId, 'kind:', event.track.kind);
-            
-            setVideos((prevVideos) => {
-                const existing = prevVideos.find((video) => video.socketId === remoteSocketId);
-                
-                if (existing && existing.stream) {
-                    const trackExists = existing.stream.getTracks().find(t => t.id === event.track.id);
-                    if (!trackExists) {
-                        console.log('[AUDIO_DEBUG] [WEBRTC] Adding new track to existing stream for', remoteSocketId, 'kind:', event.track.kind);
-                        
-                        // Clean up any old track of the same kind to prevent accumulation
-                        const oldTracks = existing.stream.getTracks().filter(t => t.kind === event.track.kind);
-                        oldTracks.forEach(t => existing.stream.removeTrack(t));
-                        
-                        existing.stream.addTrack(event.track);
-                    }
-                    return [...prevVideos]; 
-                }
+            console.info('[WEBRTC_DIAG] Remote track received', {
+                meetingId: meetingCode,
+                remoteId: remoteSocketId,
+                participantId: remoteSocketId,
+                kind: event.track.kind,
+                trackId: event.track.id,
+                readyState: event.track.readyState,
+                enabled: event.track.enabled,
+                muted: event.track.muted,
+                streamless: !event.streams?.[0],
+                streamId: event.streams?.[0]?.id || null,
+                signalingState: peerConnection.signalingState,
+                connectionState: peerConnection.connectionState,
+                iceConnectionState: peerConnection.iceConnectionState,
+            });
+            // Keep exactly one stable remote MediaStream per peer socket. Some browsers
+            // deliver streamless track events, and renegotiation can deliver a new track
+            // for a kind already present in the peer's stream.
+            let remoteStream = remoteVideosRef.current[remoteSocketId];
+            if (!remoteStream) {
+                remoteStream = event.streams?.[0] || new MediaStream();
+                remoteVideosRef.current[remoteSocketId] = remoteStream;
+            }
+            const incomingTrack = event.track;
+            if (!remoteStream.getTracks().some((track) => track.id === incomingTrack.id)) {
+                remoteStream.getTracks()
+                    .filter((track) => track.kind === incomingTrack.kind)
+                    .forEach((track) => remoteStream.removeTrack(track));
+                remoteStream.addTrack(incomingTrack);
+            }
 
-                const newStream = event.streams?.[0] || new MediaStream([event.track]);
-                const isScreenShare = /screen/i.test(event.track?.label || '') || newStream.getVideoTracks().some((track) => /screen/i.test(track.label || ''));
-                
-                console.log('[AUDIO_DEBUG] Remote stream received/created for', remoteSocketId);
-                console.log('[AUDIO_DEBUG] Audio track received:', !!newStream.getAudioTracks().length);
-                console.log('[AUDIO_DEBUG] Video track received:', !!newStream.getVideoTracks().length);
-                
-                remoteVideosRef.current[remoteSocketId] = newStream;
-
-                return [...prevVideos, { socketId: remoteSocketId, stream: newStream, autoplay: true, playsinline: true, isScreenShare }];
+            const publishRemoteStream = () => {
+                console.info("[WEBRTC_DIAG] Assigning remote stream", {
+                    meetingId: meetingCode,
+                    remoteParticipantId: remoteSocketId,
+                    streamId: remoteStream.id,
+                    trackKinds: remoteStream.getTracks().map((track) => ({
+                        kind: track.kind,
+                        trackId: track.id,
+                        readyState: track.readyState,
+                        enabled: track.enabled,
+                        muted: track.muted,
+                    })),
+                    connectionState: peerConnection.connectionState,
+                    iceConnectionState: peerConnection.iceConnectionState,
+                });
+                setVideos((previous) => {
+                    const isScreenShare = remoteStream.getVideoTracks().some((track) => /screen/i.test(track.label || ''));
+                    const nextPeer = { socketId: remoteSocketId, stream: remoteStream, autoplay: true, playsinline: true, isScreenShare };
+                    const existingIndex = previous.findIndex((entry) => entry.socketId === remoteSocketId);
+                    if (existingIndex < 0) return [...previous, nextPeer];
+                    return previous.map((entry, index) => index === existingIndex ? nextPeer : entry);
+                });
+            };
+            incomingTrack.onmute = publishRemoteStream;
+            incomingTrack.onunmute = () => {
+                console.info('[WEBRTC_DIAG] Remote track unmuted', { remoteId: remoteSocketId, kind: incomingTrack.kind });
+                publishRemoteStream();
+            };
+            incomingTrack.onended = () => {
+                console.warn('[WEBRTC_DIAG] Remote track ended', { remoteId: remoteSocketId, kind: incomingTrack.kind });
+                publishRemoteStream();
+            };
+            publishRemoteStream();
+            console.log('[WEBRTC] Remote stream updated for', remoteSocketId, {
+                audioTracks: remoteStream.getAudioTracks().length,
+                videoTracks: remoteStream.getVideoTracks().length,
             });
         };
 
         const localTrackSource = cameraStreamRef.current || window.localStream;
         if (localTrackSource) {
-            console.log('[WEBRTC] Adding local tracks to new peer connection for', remoteSocketId);
-            localTrackSource.getTracks().forEach((track) => peerConnection.addTrack(track, localTrackSource));
+            const localTracks = localTrackSource.getTracks();
+            console.info("[WEBRTC_DIAG] Adding local tracks to new peer connection", {
+                meetingId: meetingCode,
+                localParticipantId: socketIdRef.current,
+                remoteParticipantId: remoteSocketId,
+                streamId: localTrackSource.id,
+                tracks: localTracks.map((track) => ({
+                    kind: track.kind,
+                    trackId: track.id,
+                    readyState: track.readyState,
+                    enabled: track.enabled,
+                })),
+            });
+            localTracks.forEach((track) => peerConnection.addTrack(track, localTrackSource));
         }
 
         peerConnectionsRef.current[remoteSocketId] = peerConnection;
@@ -501,106 +810,261 @@ export default function VideoMeetComponent() {
     useEffect(() => {
         let active = true;
         const sampleConnections = async () => {
-            const peerEntries = Object.entries(peerConnectionsRef.current);
-            if (!peerEntries.length) {
-                if (active) setNetworkQuality("Checking");
-                return;
-            }
-            await applyVideoQuality(videoQualityMode === "auto" ? activeVideoQuality : videoQualityMode);
-
-            const readings = await Promise.all(peerEntries.map(async ([socketId, peerConnection]) => {
-                if (!peerConnection || peerConnection.signalingState === "closed" || typeof peerConnection.getStats !== "function") return null;
-                try {
-                    const reports = await peerConnection.getStats();
-                    let candidatePair;
-                    let inboundVideo;
-                    let outboundVideo;
-                    reports.forEach((report) => {
-                        if (report.type === "candidate-pair" && (report.selected || report.nominated)) {
-                            candidatePair = report;
-                        } else if (report.type === "inbound-rtp" && (report.kind || report.mediaType) === "video" && !report.isRemote) {
-                            inboundVideo = report;
-                        } else if (report.type === "outbound-rtp" && (report.kind || report.mediaType) === "video" && !report.isRemote) {
-                            outboundVideo = report;
-                        }
-                    });
-
-                    const previous = statsPreviousRef.current[socketId];
-                    const now = Date.now();
-                    const bitrate = outboundVideo && previous && now > previous.time
-                        ? Math.max(0, ((outboundVideo.bytesSent - previous.bytesSent) * 8 * 1000) / (now - previous.time))
-                        : candidatePair?.availableOutgoingBitrate;
-                    if (outboundVideo) {
-                        statsPreviousRef.current[socketId] = { bytesSent: outboundVideo.bytesSent, time: now };
+            if (statsPollInFlightRef.current) return;
+            statsPollInFlightRef.current = true;
+            try {
+                const peerEntries = Object.entries(peerConnectionsRef.current);
+                if (!peerEntries.length) {
+                    const assessment = networkAssessmentRef.current;
+                    if (Date.now() - assessment.startedAt >= NETWORK_QUALITY_THRESHOLDS.unavailableAfterMs) {
+                        assessment.stableQuality = "Unavailable";
+                        setNetworkQuality("Unavailable");
+                        setNetworkQualityDetails("No active peer connections are available for measurement.");
+                    } else {
+                        setNetworkQuality("Checking");
                     }
-                    const packetLoss = inboundVideo && Number.isFinite(inboundVideo.packetsLost)
-                        ? Math.max(0, inboundVideo.packetsLost) /
-                          Math.max(1, (inboundVideo.packetsReceived || 0) + Math.max(0, inboundVideo.packetsLost))
-                        : null;
-                    return {
-                        rtt: candidatePair?.currentRoundTripTime,
-                        bitrate,
-                        packetLoss,
-                        jitter: inboundVideo?.jitter,
+                    return;
+                }
+                const readings = await Promise.all(peerEntries.map(async ([socketId, peerConnection]) => {
+                    const recovery = peerRecoveryRef.current[socketId];
+                    if (!peerConnection || peerConnection.signalingState === "closed") {
+                        return { socketId, iceState: "closed", connectionState: "closed", metrics: {} };
+                    }
+
+                    const reading = {
+                        meetingId: meetingCode,
+                        socketId,
                         iceState: peerConnection.iceConnectionState,
                         connectionState: peerConnection.connectionState,
+                        recovering: Boolean(recovery?.recovering || recovery?.graceTimer || recovery?.retryTimer),
+                        metrics: {},
                     };
-                } catch (error) {
-                    console.warn(`[WEBRTC] Unable to read connection statistics for ${socketId}:`, error);
-                    return null;
+                    if (typeof peerConnection.getStats !== "function") return reading;
+
+                    try {
+                        const reports = await peerConnection.getStats();
+                        const reportList = [];
+                        reports.forEach((report) => reportList.push(report));
+                        const transportSelectedIds = new Set(reportList
+                            .filter((report) => report.type === "transport" && report.selectedCandidatePairId)
+                            .map((report) => report.selectedCandidatePairId));
+                        const candidatePairs = reportList.filter((report) => report.type === "candidate-pair");
+                        const candidatePair = candidatePairs.find((report) => transportSelectedIds.has(report.id)) ||
+                            candidatePairs.find((report) => report.selected === true) ||
+                            candidatePairs.find((report) => report.state === "succeeded" && report.nominated === true);
+                        const remoteInboundReports = reportList.filter((report) =>
+                            report.type === "remote-inbound-rtp" && Number.isFinite(report.roundTripTime)
+                        );
+                        const rttSeconds = candidatePair?.currentRoundTripTime ??
+                            remoteInboundReports[0]?.roundTripTime;
+                        if (Number.isFinite(rttSeconds) && rttSeconds >= 0) {
+                            reading.metrics.rttMs = rttSeconds * 1000;
+                        }
+                        if (Number.isFinite(candidatePair?.availableOutgoingBitrate) &&
+                            candidatePair.availableOutgoingBitrate > 0) {
+                            reading.metrics.availableOutgoingBitrate = candidatePair.availableOutgoingBitrate;
+                        }
+
+                        const inboundReports = reportList.filter((report) =>
+                            report.type === "inbound-rtp" && !report.isRemote &&
+                            ["audio", "video"].includes(report.kind || report.mediaType)
+                        );
+                        reading.inboundVideo = inboundReports
+                            .filter((report) => (report.kind || report.mediaType) === "video")
+                            .map((report) => ({
+                                reportId: report.id,
+                                bytesReceived: report.bytesReceived,
+                                packetsReceived: report.packetsReceived,
+                                framesReceived: report.framesReceived,
+                                framesDecoded: report.framesDecoded,
+                                framesDropped: report.framesDropped,
+                            }));
+                        const previousPeerStats = networkAssessmentRef.current.previousPeerStats[socketId] || {};
+                        const nextPeerStats = {};
+                        let intervalReceived = 0;
+                        let intervalLost = 0;
+                        let hasPacketInterval = false;
+                        let maxJitterMs;
+                        inboundReports.forEach((report) => {
+                            if (Number.isFinite(report.jitter)) {
+                                const jitterMs = report.jitter * 1000;
+                                maxJitterMs = Math.max(maxJitterMs ?? 0, jitterMs);
+                            }
+                            const previousReport = previousPeerStats[report.id];
+                            if (previousReport &&
+                                Number.isFinite(report.packetsReceived) && Number.isFinite(report.packetsLost) &&
+                                report.packetsReceived >= previousReport.packetsReceived &&
+                                report.packetsLost >= previousReport.packetsLost) {
+                                const receivedDelta = report.packetsReceived - previousReport.packetsReceived;
+                                const lostDelta = Math.max(0, report.packetsLost - previousReport.packetsLost);
+                                if (receivedDelta + lostDelta > 0) {
+                                    intervalReceived += receivedDelta;
+                                    intervalLost += lostDelta;
+                                    hasPacketInterval = true;
+                                }
+                            }
+                            nextPeerStats[report.id] = {
+                                packetsReceived: report.packetsReceived,
+                                packetsLost: report.packetsLost,
+                            };
+                        });
+                        if (maxJitterMs !== undefined) reading.metrics.jitterMs = maxJitterMs;
+                        if (hasPacketInterval) {
+                            reading.metrics.packetLoss = intervalLost / (intervalReceived + intervalLost);
+                        }
+                        networkAssessmentRef.current.previousPeerStats[socketId] = nextPeerStats;
+
+                        const outboundVideo = reportList.find((report) =>
+                            report.type === "outbound-rtp" && !report.isRemote &&
+                            (report.kind || report.mediaType) === "video"
+                        );
+                        const previousOutbound = statsPreviousRef.current[socketId];
+                        const now = Date.now();
+                        const videoBitrate = outboundVideo && previousOutbound &&
+                            Number.isFinite(outboundVideo.bytesSent) &&
+                            Number.isFinite(previousOutbound.bytesSent) &&
+                            now > previousOutbound.time
+                            ? Math.max(0, ((outboundVideo.bytesSent - previousOutbound.bytesSent) * 8000) /
+                                (now - previousOutbound.time))
+                            : undefined;
+                        if (outboundVideo) {
+                            statsPreviousRef.current[socketId] = { bytesSent: outboundVideo.bytesSent, time: now };
+                            if (Number.isFinite(videoBitrate)) reading.metrics.outboundVideoBitrate = videoBitrate;
+                            if (Number.isFinite(outboundVideo.framesPerSecond)) {
+                                reading.metrics.outboundFramesPerSecond = outboundVideo.framesPerSecond;
+                            }
+                        }
+                        console.debug("[NETWORK_DIAG] Peer stats", reading);
+                    } catch (error) {
+                        console.warn(`[WEBRTC] Unable to read connection statistics for ${socketId}:`, error);
+                    }
+                    return reading;
+                }));
+                if (!active) return;
+
+                const now = Date.now();
+                const assessment = networkAssessmentRef.current;
+                const recoveryFailed = readings.some((reading) =>
+                    peerRecoveryRef.current[reading.socketId]?.failureNotified
+                );
+                const reconnecting = readings.some((reading) =>
+                    reading.recovering ||
+                    ["disconnected", "failed"].includes(reading.iceState) ||
+                    ["disconnected", "failed"].includes(reading.connectionState)
+                );
+                const validReadings = readings.filter((reading) =>
+                    reading.connectionState === "connected" &&
+                    ["rttMs", "packetLoss", "jitterMs", "availableOutgoingBitrate"]
+                        .some((metric) => Number.isFinite(reading.metrics[metric]))
+                );
+
+                let measuredQuality = null;
+                if (validReadings.length) {
+                    let poor = false;
+                    let fair = false;
+                    validReadings.forEach(({ metrics }) => {
+                        poor = poor || metrics.rttMs > NETWORK_QUALITY_THRESHOLDS.rttPoorMs ||
+                            metrics.packetLoss > NETWORK_QUALITY_THRESHOLDS.packetLossPoor ||
+                            metrics.jitterMs > NETWORK_QUALITY_THRESHOLDS.jitterPoorMs ||
+                            metrics.availableOutgoingBitrate < NETWORK_QUALITY_THRESHOLDS.availableBitratePoor;
+                        fair = fair || metrics.rttMs > NETWORK_QUALITY_THRESHOLDS.rttFairMs ||
+                            metrics.packetLoss > NETWORK_QUALITY_THRESHOLDS.packetLossFair ||
+                            metrics.jitterMs > NETWORK_QUALITY_THRESHOLDS.jitterFairMs ||
+                            metrics.availableOutgoingBitrate < NETWORK_QUALITY_THRESHOLDS.availableBitrateFair;
+                    });
+                    measuredQuality = poor
+                        ? "Poor"
+                        : fair
+                            ? "Fair"
+                            : validReadings.length === readings.length
+                                ? "Good"
+                                : null;
+                    assessment.lastValidAt = now;
                 }
-            }));
-            if (!active) return;
 
-            const usableReadings = readings.filter(Boolean);
-            const hasRecovery = Object.values(peerRecoveryRef.current).some((recovery) =>
-                recovery.recovering || recovery.graceTimer || recovery.retryTimer || recovery.failureNotified
-            );
-            const recoveryFailed = Object.values(peerRecoveryRef.current).some((recovery) => recovery.failureNotified);
-            const disconnected = usableReadings.some((reading) =>
-                ["disconnected", "failed"].includes(reading.iceState) ||
-                ["disconnected", "failed"].includes(reading.connectionState)
-            );
-            if (recoveryFailed) {
-                setNetworkQuality("Poor");
-            } else if (hasRecovery || disconnected) {
-                setNetworkQuality("Reconnecting");
-            } else if (!usableReadings.length || !usableReadings.some((reading) =>
-                Number.isFinite(reading.rtt) || Number.isFinite(reading.packetLoss) ||
-                Number.isFinite(reading.jitter) || Number.isFinite(reading.bitrate)
-            )) {
-                setNetworkQuality("Checking");
-            } else {
-                const maxRtt = Math.max(0, ...usableReadings.map((reading) => reading.rtt || 0));
-                const maxLoss = Math.max(0, ...usableReadings.map((reading) => reading.packetLoss || 0));
-                const maxJitter = Math.max(0, ...usableReadings.map((reading) => reading.jitter || 0));
-                const minBitrate = Math.min(...usableReadings
-                    .map((reading) => reading.bitrate)
-                    .filter((bitrate) => Number.isFinite(bitrate) && bitrate > 0), Infinity);
-                const measuredNetwork = maxRtt > 0.5 || maxLoss > 0.08 || maxJitter > 0.04 || minBitrate < 300000
-                    ? "Poor"
-                    : maxRtt > 0.25 || maxLoss > 0.03 || maxJitter > 0.02 || minBitrate < 900000
-                        ? "Fair"
-                        : "Good";
-                setNetworkQuality(measuredNetwork);
+                let displayQuality;
+                if (reconnecting && !recoveryFailed) {
+                    displayQuality = "Reconnecting";
+                    assessment.candidateQuality = null;
+                    assessment.candidateCount = 0;
+                } else if (recoveryFailed) {
+                    displayQuality = "Poor";
+                    assessment.candidateQuality = null;
+                    assessment.candidateCount = 0;
+                } else if (!measuredQuality) {
+                    const lastValidAt = assessment.lastValidAt || assessment.startedAt;
+                    displayQuality = now - lastValidAt >= NETWORK_QUALITY_THRESHOLDS.unavailableAfterMs
+                        ? "Unavailable"
+                        : "Checking";
+                    assessment.candidateQuality = null;
+                    assessment.candidateCount = 0;
+                } else {
+                    if (assessment.candidateQuality === measuredQuality) {
+                        assessment.candidateCount += 1;
+                    } else {
+                        assessment.candidateQuality = measuredQuality;
+                        assessment.candidateCount = 1;
+                    }
+                    const requiredSamples = measuredQuality === "Good"
+                        ? NETWORK_QUALITY_THRESHOLDS.healthySamplesRequired
+                        : NETWORK_QUALITY_THRESHOLDS.degradedSamplesRequired;
+                    if (assessment.candidateCount >= requiredSamples) {
+                        assessment.stableQuality = measuredQuality;
+                    }
+                    displayQuality = assessment.stableQuality;
+                }
 
-                if (videoQualityMode === "auto") {
-                    const target = measuredNetwork === "Poor" ? "Low" : measuredNetwork === "Fair" ? "Medium" : "High";
+                const metricsSummary = validReadings.map(({ socketId, metrics }) => {
+                    const values = [];
+                    if (Number.isFinite(metrics.rttMs)) values.push(`RTT ${Math.round(metrics.rttMs)} ms`);
+                    if (Number.isFinite(metrics.packetLoss)) values.push(`loss ${(metrics.packetLoss * 100).toFixed(1)}%`);
+                    if (Number.isFinite(metrics.jitterMs)) values.push(`jitter ${Math.round(metrics.jitterMs)} ms`);
+                    if (Number.isFinite(metrics.availableOutgoingBitrate)) {
+                        values.push(`available ${(metrics.availableOutgoingBitrate / 1000).toFixed(0)} kbps`);
+                    }
+                    if (Number.isFinite(metrics.outboundVideoBitrate)) {
+                        values.push(`video TX ${(metrics.outboundVideoBitrate / 1000).toFixed(0)} kbps`);
+                    }
+                    return `${socketId}: ${values.join(", ") || "connected; measurements unavailable"}`;
+                });
+                const details = metricsSummary.length
+                    ? metricsSummary.join(" | ")
+                    : readings.map(({ socketId, connectionState, iceState }) =>
+                        `${socketId}: ${connectionState}/${iceState}`
+                    ).join(" | ") || "No peer connections are available.";
+                setNetworkQuality(displayQuality);
+                setNetworkQualityDetails(details);
+                console.info("[NETWORK_DIAG] Meeting network status", {
+                    status: displayQuality,
+                    measuredQuality,
+                    peerCount: readings.length,
+                    measuredPeerCount: validReadings.length,
+                    details,
+                });
+
+                if (videoQualityMode !== "auto") {
+                    const applied = await applyVideoQuality(videoQualityMode);
+                    if (applied && activeVideoQuality !== videoQualityMode) {
+                        setActiveVideoQuality(videoQualityMode);
+                    }
+                } else if (measuredQuality) {
+                    const desiredQuality = measuredQuality === "Poor" ? "Low" : measuredQuality === "Fair" ? "Medium" : "High";
                     const rank = { Low: 0, Medium: 1, High: 2 };
-                    const lowering = rank[target] < rank[activeVideoQuality];
+                    const lowering = rank[desiredQuality] < rank[activeVideoQuality];
                     const canRaise = Date.now() - qualityLastChangedRef.current >= 20000;
-                    if (lowering || (rank[target] > rank[activeVideoQuality] && canRaise)) {
+                    const target = lowering || (rank[desiredQuality] > rank[activeVideoQuality] && canRaise)
+                        ? desiredQuality
+                        : activeVideoQuality;
+                    const applied = await applyVideoQuality(target);
+                    if (applied && target !== activeVideoQuality) {
                         setActiveVideoQuality(target);
                         qualityLastChangedRef.current = Date.now();
-                        await applyVideoQuality(target);
-                    }
-                } else {
-                    const target = videoQualityMode;
-                    if (target !== activeVideoQuality) {
-                        setActiveVideoQuality(target);
-                        await applyVideoQuality(target);
                     }
                 }
+            } catch (error) {
+                console.error("[WEBRTC] Connection statistics sampling failed:", error);
+            } finally {
+                statsPollInFlightRef.current = false;
             }
         };
 
@@ -610,22 +1074,79 @@ export default function VideoMeetComponent() {
             active = false;
             window.clearInterval(timer);
         };
-    }, [videoQualityMode, activeVideoQuality]);
+    }, [videoQualityMode, activeVideoQuality, meetingCode]);
 
-    const createOfferForPeer = async (remoteSocketId) => {
+    const createOfferForPeer = async (remoteSocketId, queueIfBusy = true) => {
         const peerConnection = ensurePeerConnection(remoteSocketId);
         if (!peerConnection || !socketRef.current || !socketIdRef.current) return;
-        if (peerConnection.signalingState !== 'stable') return;
+        if (peerConnection.signalingState !== 'stable' || makingOfferRef.current[remoteSocketId]) {
+            if (queueIfBusy) pendingNegotiationRef.current[remoteSocketId] = true;
+            return;
+        }
 
+        makingOfferRef.current[remoteSocketId] = true;
         try {
             if (window.debugStats) window.debugStats.createOffer++;
-            console.log('[WEBRTC] Creating offer for', remoteSocketId);
+            console.info('[WEBRTC_DIAG] Creating offer', {
+                meetingId: meetingCode,
+                localId: socketIdRef.current,
+                remoteId: remoteSocketId,
+                signalingState: peerConnection.signalingState,
+                connectionState: peerConnection.connectionState,
+            });
             const offerDescription = await peerConnection.createOffer();
             await peerConnection.setLocalDescription(offerDescription);
+            console.info('[WEBRTC_DIAG] Sending offer', {
+                meetingId: meetingCode,
+                localId: socketIdRef.current,
+                remoteId: remoteSocketId,
+                signalingState: peerConnection.signalingState,
+                transceivers: peerConnection.getTransceivers().map(({ mid, direction, sender }) => ({
+                    mid,
+                    direction,
+                    kind: sender.track?.kind,
+                    trackReadyState: sender.track?.readyState,
+                })),
+            });
             socketRef.current.emit('offer', { target: remoteSocketId, sender: socketIdRef.current, sdp: peerConnection.localDescription });
         } catch (error) {
-            console.error('[WEBRTC] createOfferForPeer error:', error);
+            console.error('[WEBRTC] createOfferForPeer error:', {
+                meetingId: meetingCode,
+                localParticipantId: socketIdRef.current,
+                remoteParticipantId: remoteSocketId,
+                signalingState: peerConnection.signalingState,
+                connectionState: peerConnection.connectionState,
+                error,
+            });
+        } finally {
+            makingOfferRef.current[remoteSocketId] = false;
         }
+    };
+
+    const reconcileMeshPeers = (participantsList) => {
+        if (!socketIdRef.current || !Array.isArray(participantsList)) return;
+
+        participantsList.forEach((participant) => {
+            const remoteSocketId = participant?.socketId;
+            if (!remoteSocketId || remoteSocketId === socketIdRef.current) return;
+
+            const peerConnection = ensurePeerConnection(remoteSocketId);
+            if (!peerConnection) return;
+
+            console.info('[WEBRTC_DIAG] Reconciling mesh peer', {
+                meetingId: meetingCode,
+                localId: socketIdRef.current,
+                remoteId: remoteSocketId,
+                signalingState: peerConnection.signalingState,
+                connectionState: peerConnection.connectionState,
+            });
+            if (socketIdRef.current < remoteSocketId &&
+                peerConnection.signalingState === 'stable' &&
+                !peerConnection.localDescription &&
+                !peerConnection.remoteDescription) {
+                createOfferForPeer(remoteSocketId, false);
+            }
+        });
     };
 
     const syncLocalStream = (stream, options = {}) => {
@@ -637,9 +1158,23 @@ export default function VideoMeetComponent() {
 
         const canonicalLocalStream = isScreenShare ? (cameraStreamRef.current || window.localStream || stream) : stream;
         window.localStream = canonicalLocalStream;
+        if (!isScreenShare) {
+            setLocalStream(canonicalLocalStream);
+        }
 
         if (shouldPreview && !isScreenShare) {
             attachLocalPreview(stream);
+        }
+
+        if (!stream) {
+            Object.values(peerConnectionsRef.current).forEach((peerConnection) => {
+                peerConnection?.getSenders?.().forEach((sender) => {
+                    if (sender.track) sender.replaceTrack(null).catch((error) => {
+                        console.warn('[WEBRTC] Unable to detach an unavailable local track:', error);
+                    });
+                });
+            });
+            return;
         }
 
         Object.keys(peerConnectionsRef.current).forEach((remoteSocketId) => {
@@ -647,21 +1182,65 @@ export default function VideoMeetComponent() {
             if (!peerConnection) return;
 
             let needsNegotiation = false;
+            const trackUpdates = [];
+            const streamTrackKinds = new Set(stream.getTracks().map((track) => track.kind));
             stream.getTracks().forEach((track) => {
-                const existingSender = peerConnection.getSenders().find((sender) => sender.track?.kind === track.kind);
+                const { sender: existingSender, transceiver } = getSenderForTrackKind(peerConnection, track.kind);
                 if (existingSender) {
-                    console.log('[AUDIO_DEBUG] replaceTrack() called for kind:', track.kind);
-                    existingSender.replaceTrack(track).catch(() => {});
+                    if (!existingSender.track && transceiver && transceiver.direction !== 'sendrecv' && transceiver.direction !== 'sendonly') {
+                        console.info('[WEBRTC_DIAG] Enabling local sending on existing transceiver', {
+                            remoteId: remoteSocketId,
+                            kind: track.kind,
+                            previousDirection: transceiver.direction,
+                        });
+                        transceiver.direction = transceiver.direction === 'recvonly' ? 'sendrecv' : 'sendonly';
+                        needsNegotiation = true;
+                    }
+                    trackUpdates.push(existingSender.replaceTrack(track).then(() => {
+                        console.info('[WEBRTC_DIAG] Local track attached to peer sender', {
+                                        meetingId: meetingCode,
+                                        localParticipantId: socketIdRef.current,
+                                        remoteId: remoteSocketId,
+                            kind: track.kind,
+                            trackId: track.id,
+                            readyState: track.readyState,
+                            enabled: track.enabled,
+                            transceiverDirection: transceiver?.direction,
+                        });
+                    }));
                 } else {
-                    console.log('[AUDIO_DEBUG] addTrack() called for kind:', track.kind);
+                    console.info('[WEBRTC_DIAG] Adding local track to peer connection', {
+                        meetingId: meetingCode,
+                        localParticipantId: socketIdRef.current,
+                        remoteId: remoteSocketId,
+                        kind: track.kind,
+                        trackId: track.id,
+                        readyState: track.readyState,
+                        enabled: track.enabled,
+                    });
                     peerConnection.addTrack(track, stream);
                     needsNegotiation = true;
                 }
             });
 
-            if (needsNegotiation) {
-                createOfferForPeer(remoteSocketId);
+            if (!isScreenShare) {
+                peerConnection.getSenders().forEach((sender) => {
+                    if (sender.track && !streamTrackKinds.has(sender.track.kind)) {
+                        const trackKind = sender.track.kind;
+                        sender.replaceTrack(null).catch((error) => {
+                            console.warn(`[WEBRTC] Unable to detach unavailable local ${trackKind} track:`, error);
+                        });
+                    }
+                });
             }
+
+            Promise.all(trackUpdates)
+                .then(() => {
+                    if (needsNegotiation) createOfferForPeer(remoteSocketId);
+                })
+                .catch((error) => {
+                    console.error(`[WEBRTC] Unable to synchronize local tracks with ${remoteSocketId}:`, error);
+                });
         });
     };
 
@@ -687,11 +1266,6 @@ export default function VideoMeetComponent() {
                     setAudio(false);
                     socketRef.current?.emit('participant-muted', meetingCode);
                 }
-                try {
-                    stream.getTracks().forEach((trackToStop) => trackToStop.stop());
-                } catch (e) { console.log(e) }
-                const blackSilence = (...args) => new MediaStream([black(...args), silence()]);
-                syncLocalStream(blackSilence());
             };
         });
     };
@@ -702,11 +1276,16 @@ export default function VideoMeetComponent() {
         console.log('[MEDIA] getUserMedia() — wantsVideo:', wantsVideo, 'wantsAudio:', wantsAudio);
 
         if (!wantsVideo && !wantsAudio) {
-            console.log('[MEDIA] getUserMedia() — nothing wanted, using black silence stream.');
-            stopMediaStream(cameraStreamRef.current);
-            cameraStreamRef.current = null;
-            const blackSilence = (...args) => new MediaStream([black(...args), silence()]);
-            syncLocalStream(blackSilence());
+            const existingStream = cameraStreamRef.current;
+            const hasLiveTrack = existingStream?.getTracks().some((track) => track.readyState === 'live');
+            if (hasLiveTrack) {
+                existingStream.getTracks().forEach((track) => { track.enabled = false; });
+                syncLocalStream(existingStream);
+                return;
+            }
+
+            console.log('[MEDIA] getUserMedia() — no active devices; clearing local media tracks.');
+            replaceCameraStream(null);
             return;
         }
 
@@ -716,7 +1295,7 @@ export default function VideoMeetComponent() {
         if (existingStream) {
             const videoLive = existingStream.getVideoTracks().some(t => t.readyState === 'live');
             const audioLive = existingStream.getAudioTracks().some(t => t.readyState === 'live');
-            if ((wantsVideo && videoLive) || (wantsAudio && audioLive)) {
+            if ((!wantsVideo || videoLive) && (!wantsAudio || audioLive)) {
                 console.log('[MEDIA] getUserMedia() — reusing existing live stream from getPermissions(). Skipping new permission request.');
                 // Enable/disable tracks to match current wants
                 existingStream.getVideoTracks().forEach(t => { t.enabled = wantsVideo; });
@@ -727,7 +1306,7 @@ export default function VideoMeetComponent() {
         }
 
         console.log('[MEDIA] getUserMedia() — requesting new stream from browser...');
-        navigator.mediaDevices.getUserMedia({ 
+        getMediaWithAudioProcessingFallback({
             video: wantsVideo, 
             audio: wantsAudio ? { echoCancellation: true, noiseSuppression: true, autoGainControl: true } : false 
         })
@@ -742,16 +1321,16 @@ export default function VideoMeetComponent() {
                         .then((stream) => {
                             console.log('[MEDIA] getUserMedia() — fallback: video-only stream obtained.');
                             setAudio(false);
+                            socketRef.current?.emit('participant-muted', meetingCode);
                             getUserMediaSuccess(stream);
                         })
                         .catch(() => {
                             console.error('[MEDIA] getUserMedia() — all fallbacks failed.');
                             setVideo(false);
                             setAudio(false);
-                            stopMediaStream(cameraStreamRef.current);
-                            cameraStreamRef.current = null;
-                            const blackSilence = (...args) => new MediaStream([black(...args), silence()]);
-                            syncLocalStream(blackSilence());
+                            socketRef.current?.emit('participant-camera-disabled', meetingCode);
+                            socketRef.current?.emit('participant-muted', meetingCode);
+                            replaceCameraStream(null);
                             setSnackMessage(error?.name === 'NotReadableError' ? 'Camera is already in use by another browser or app.' : 'Unable to start camera.');
                             setSnackOpen(true);
                         });
@@ -766,6 +1345,7 @@ export default function VideoMeetComponent() {
                     setAudio(false);
                     socketRef.current?.emit('participant-muted', meetingCode);
                 }
+                replaceCameraStream(null);
                 setSnackMessage(error?.name === 'NotReadableError' ? 'Camera or microphone is already in use by another browser or app.' : 'Unable to start media device.');
                 setSnackOpen(true);
             });
@@ -789,43 +1369,181 @@ export default function VideoMeetComponent() {
 
     const handleOffer = async (payload) => {
         if (!payload || payload.sender === socketIdRef.current) return;
-        console.log('[WEBRTC] Received offer from', payload.sender);
+        console.info('[WEBRTC_DIAG] Offer received', {
+            meetingId: meetingCode,
+            localId: socketIdRef.current,
+            remoteId: payload.sender,
+            signalingState: peerConnectionsRef.current[payload.sender]?.signalingState || 'new',
+            sdpType: payload.sdp?.type,
+        });
         const peerConnection = ensurePeerConnection(payload.sender);
         if (!peerConnection) return;
         try {
+            const offerCollision = peerConnection.signalingState !== 'stable' || makingOfferRef.current[payload.sender];
+            const polite = socketIdRef.current > payload.sender;
+            if (offerCollision && !polite) {
+                console.warn("[WEBRTC_DIAG] Ignoring colliding offer", {
+                    meetingId: meetingCode,
+                    localParticipantId: socketIdRef.current,
+                    remoteParticipantId: payload.sender,
+                    polite,
+                    signalingState: peerConnection.signalingState,
+                });
+                pendingNegotiationRef.current[payload.sender] = true;
+                return;
+            }
+            if (offerCollision) {
+                await peerConnection.setLocalDescription({ type: 'rollback' });
+            }
             await peerConnection.setRemoteDescription(new RTCSessionDescription(payload.sdp));
+            console.info("[WEBRTC_DIAG] Offer remote description applied", {
+                meetingId: meetingCode,
+                localParticipantId: socketIdRef.current,
+                remoteParticipantId: payload.sender,
+                signalingState: peerConnection.signalingState,
+            });
+            await applyPendingIceCandidates(payload.sender, peerConnection);
             if (window.debugStats) window.debugStats.createAnswer++;
             const answerDescription = await peerConnection.createAnswer();
             await peerConnection.setLocalDescription(answerDescription);
-            console.log('[WEBRTC] Sending answer to', payload.sender);
+            console.info('[WEBRTC_DIAG] Sending answer', {
+                meetingId: meetingCode,
+                localId: socketIdRef.current,
+                remoteId: payload.sender,
+                signalingState: peerConnection.signalingState,
+                transceivers: peerConnection.getTransceivers().map(({ mid, direction, sender }) => ({
+                    mid,
+                    direction,
+                    kind: sender.track?.kind,
+                    trackReadyState: sender.track?.readyState,
+                })),
+            });
             socketRef.current.emit('answer', { target: payload.sender, sender: socketIdRef.current, sdp: peerConnection.localDescription });
+            if (pendingNegotiationRef.current[payload.sender]) {
+                delete pendingNegotiationRef.current[payload.sender];
+                await createOfferForPeer(payload.sender);
+            }
         } catch (error) {
-            console.error('[WEBRTC] handleOffer error:', error);
+            console.error('[WEBRTC] handleOffer error:', {
+                meetingId: meetingCode,
+                localParticipantId: socketIdRef.current,
+                remoteParticipantId: payload.sender,
+                signalingState: peerConnection.signalingState,
+                connectionState: peerConnection.connectionState,
+                error,
+            });
         }
     };
 
     const handleAnswer = async (payload) => {
         if (!payload || payload.sender === socketIdRef.current) return;
-        console.log('[WEBRTC] Received answer from', payload.sender);
+        console.info('[WEBRTC_DIAG] Answer received', {
+            meetingId: meetingCode,
+            localId: socketIdRef.current,
+            remoteId: payload.sender,
+            signalingState: peerConnectionsRef.current[payload.sender]?.signalingState || 'missing-peer',
+            sdpType: payload.sdp?.type,
+        });
         const peerConnection = peerConnectionsRef.current[payload.sender];
-        if (!peerConnection) return;
+        if (!peerConnection) {
+            console.error("[WEBRTC_DIAG] Answer received without a peer connection", {
+                meetingId: meetingCode,
+                localParticipantId: socketIdRef.current,
+                remoteParticipantId: payload.sender,
+            });
+            return;
+        }
         try {
             await peerConnection.setRemoteDescription(new RTCSessionDescription(payload.sdp));
+            console.info("[WEBRTC_DIAG] Answer remote description applied", {
+                meetingId: meetingCode,
+                localParticipantId: socketIdRef.current,
+                remoteParticipantId: payload.sender,
+                signalingState: peerConnection.signalingState,
+            });
+            await applyPendingIceCandidates(payload.sender, peerConnection);
             console.log('[WEBRTC] Answer applied — connection with', payload.sender, 'established.');
+            if (pendingNegotiationRef.current[payload.sender]) {
+                delete pendingNegotiationRef.current[payload.sender];
+                await createOfferForPeer(payload.sender);
+            }
         } catch (error) {
-            console.error('[WEBRTC] handleAnswer error:', error);
+            console.error('[WEBRTC] handleAnswer error:', {
+                meetingId: meetingCode,
+                localParticipantId: socketIdRef.current,
+                remoteParticipantId: payload.sender,
+                signalingState: peerConnection.signalingState,
+                connectionState: peerConnection.connectionState,
+                error,
+            });
+        }
+    };
+
+    const applyPendingIceCandidates = async (remoteSocketId, peerConnection) => {
+        const candidates = pendingIceCandidatesRef.current[remoteSocketId] || [];
+        delete pendingIceCandidatesRef.current[remoteSocketId];
+        if (candidates.length) {
+            console.info("[WEBRTC_DIAG] Applying buffered ICE candidates", {
+                meetingId: meetingCode,
+                localParticipantId: socketIdRef.current,
+                remoteParticipantId: remoteSocketId,
+                queuedCount: candidates.length,
+                signalingState: peerConnection.signalingState,
+            });
+        }
+        for (const candidate of candidates) {
+            try {
+                await peerConnection.addIceCandidate(new RTCIceCandidate(candidate));
+            } catch (error) {
+                console.error('[ICE] Unable to apply queued ICE candidate:', {
+                    meetingId: meetingCode,
+                    localParticipantId: socketIdRef.current,
+                    remoteParticipantId: remoteSocketId,
+                    error,
+                });
+            }
         }
     };
 
     const handleIceCandidate = async (payload) => {
         if (!payload || payload.sender === socketIdRef.current) return;
         const peerConnection = peerConnectionsRef.current[payload.sender];
-        if (!peerConnection || !payload.candidate) return;
+        if (!payload.candidate) return;
+        if (!peerConnection || !peerConnection.remoteDescription) {
+            const pendingCandidates = pendingIceCandidatesRef.current[payload.sender] || [];
+            if (pendingCandidates.length < 256) {
+                pendingCandidates.push(payload.candidate);
+                pendingIceCandidatesRef.current[payload.sender] = pendingCandidates;
+                console.debug('[WEBRTC_DIAG] Buffered ICE candidate', {
+                    meetingId: meetingCode,
+                    localId: socketIdRef.current,
+                    remoteId: payload.sender,
+                    queuedCount: pendingCandidates.length,
+                    hasPeerConnection: Boolean(peerConnection),
+                });
+            } else {
+                console.error('[ICE] Candidate queue limit reached before remote description:', payload.sender);
+            }
+            return;
+        }
         try {
             await peerConnection.addIceCandidate(new RTCIceCandidate(payload.candidate));
-            console.log('[ICE] Applied ICE candidate from', payload.sender);
+            console.debug('[WEBRTC_DIAG] Applied ICE candidate', {
+                meetingId: meetingCode,
+                localId: socketIdRef.current,
+                remoteId: payload.sender,
+                iceConnectionState: peerConnection.iceConnectionState,
+            });
         } catch (error) {
-            console.error('[ICE] handleIceCandidate error:', error);
+            console.error('[ICE] handleIceCandidate error:', {
+                meetingId: meetingCode,
+                localParticipantId: socketIdRef.current,
+                remoteParticipantId: payload.sender,
+                hasRemoteDescription: Boolean(peerConnection.remoteDescription),
+                signalingState: peerConnection.signalingState,
+                iceConnectionState: peerConnection.iceConnectionState,
+                error,
+            });
         }
     };
 
@@ -839,7 +1557,7 @@ export default function VideoMeetComponent() {
 
         socketRef.current.on('connect', () => {
             socketIdRef.current = socketRef.current.id;
-            console.log('[SOCKET] Connected. Socket ID:', socketIdRef.current);
+        console.info('[WEBRTC_DIAG] Socket connected', { localId: socketIdRef.current });
             const joinPayload = { 
                 roomName: meetingCode, 
                 username, 
@@ -848,13 +1566,32 @@ export default function VideoMeetComponent() {
                 isVideoOn: Boolean(initialVideo && videoAvailable),
                 isAudioOn: Boolean(initialAudio && audioAvailable)
             };
-            console.log('[SOCKET] Joining meeting:', { roomName: meetingCode, isHost });
+            console.log('[SOCKET] Joining meeting:', {
+                meetingId: meetingCode,
+                participantId: socketIdRef.current,
+                username,
+                requestedHost: isHost,
+                isVideoOn: joinPayload.isVideoOn,
+                isAudioOn: joinPayload.isAudioOn,
+            });
             socketRef.current.emit('join-room', joinPayload, (result) => {
                 if (result?.ok === false) {
                     setMeetingError(result.message || "Unable to join the meeting.");
                     setAskForUsername(true);
                 }
             });
+        });
+
+        socketRef.current.on('disconnect', (reason) => {
+            console.warn('[WEBRTC_DIAG] Socket disconnected; clearing peer connections', {
+                localId: socketIdRef.current,
+                reason,
+            });
+            Object.keys(peerConnectionsRef.current).forEach(closePeerConnection);
+            setVideos([]);
+            pendingIceCandidatesRef.current = {};
+            pendingNegotiationRef.current = {};
+            makingOfferRef.current = {};
         });
 
         socketRef.current.on('chat-message', addMessage);
@@ -948,18 +1685,48 @@ export default function VideoMeetComponent() {
             socketRef.current.on('ice-candidate', handleIceCandidate);
 
             socketRef.current.on('user-connected', (participant) => {
-                console.log('[SOCKET] user-connected:', participant.username, participant.socketId);
+                console.info('[WEBRTC_DIAG] Peer announced', {
+                    meetingId: meetingCode,
+                    localId: socketIdRef.current,
+                    remoteId: participant.socketId,
+                    remoteUsername: participant.username,
+                    remoteIsHost: participant.isHost === true,
+                    shouldInitiate: participant.shouldInitiate,
+                });
                 setInWaitingRoom(false);
                 setAskForUsername(false);
-                if (participant.socketId && participant.socketId !== socketIdRef.current && participant.shouldInitiate) {
-                    console.log('[WEBRTC] Initiating peer connection + offer to newly connected user:', participant.socketId);
-                    ensurePeerConnection(participant.socketId);
-                    createOfferForPeer(participant.socketId);
+                if (participant.socketId && participant.socketId !== socketIdRef.current) {
+                    const peerConnection = ensurePeerConnection(participant.socketId);
+                    console.info('[WEBRTC_DIAG] Peer connection mapped', {
+                        localId: socketIdRef.current,
+                        remoteId: participant.socketId,
+                        connectionState: peerConnection?.connectionState,
+                        signalingState: peerConnection?.signalingState,
+                    });
+                    if (participant.shouldInitiate) {
+                        console.info('[WEBRTC_DIAG] Initiating peer negotiation', {
+                            localId: socketIdRef.current,
+                            remoteId: participant.socketId,
+                            signalingState: peerConnection?.signalingState,
+                        });
+                        createOfferForPeer(participant.socketId, false);
+                    }
                 }
             });
 
             socketRef.current.on('participants-updated', (participantsList) => {
-                setParticipants(participantsList || []);
+                const currentParticipants = participantsList || [];
+                console.info("[WEBRTC_DIAG] Participant roster received", {
+                    meetingId: meetingCode,
+                    localParticipantId: socketIdRef.current,
+                    participants: currentParticipants.map((participant) => ({
+                        participantId: participant.socketId,
+                        username: participant.username,
+                        isHost: participant.isHost === true,
+                    })),
+                });
+                setParticipants(currentParticipants);
+                reconcileMeshPeers(currentParticipants);
             });
 
             socketRef.current.on('breakout-state', (state) => {
@@ -983,21 +1750,6 @@ export default function VideoMeetComponent() {
                 closePeerConnection(socketId);
             });
     };
-
-    let silence = () => {
-        let ctx = new AudioContext()
-        let oscillator = ctx.createOscillator()
-        let dst = oscillator.connect(ctx.createMediaStreamDestination())
-        oscillator.start()
-        ctx.resume()
-        return Object.assign(dst.stream.getAudioTracks()[0], { enabled: false })
-    }
-    let black = ({ width = 640, height = 480 } = {}) => {
-        let canvas = Object.assign(document.createElement("canvas"), { width, height })
-        canvas.getContext('2d').fillRect(0, 0, width, height)
-        let stream = canvas.captureStream()
-        return Object.assign(stream.getVideoTracks()[0], { enabled: false })
-    }
 
     let handleVideo = () => {
         if (!canUseCamera) return;
@@ -1256,18 +2008,23 @@ export default function VideoMeetComponent() {
             .filter((participant) => participant.username && participant.socketId && participant.socketId !== socketIdRef.current)
             .map((participant) => {
                 const matchedStream = videos.find((entry) => entry.socketId === participant.socketId)?.stream;
+                const remoteVideoTrack = matchedStream?.getVideoTracks?.().find((track) =>
+                    track.readyState === 'live' && track.enabled !== false && !track.muted
+                );
                 return {
                     id: participant.socketId || participant.username,
                     username: participant.username,
                     isLocal: false,
                     isHost: participant.isHost === true,
                     stream: matchedStream || null,
-                    isVideoOn: participant.isVideoOn !== false && Boolean(matchedStream),
+                    isCameraEnabled: participant.isVideoOn !== false,
+                    isVideoOn: participant.isVideoOn !== false && Boolean(remoteVideoTrack),
                     isAudioOn: participant.isAudioOn !== false,
                     isScreenShare: Boolean(matchedStream && participant.isScreenShare),
+                    connectionState: peerStates[participant.socketId] || 'new',
                 };
             });
-    }, [participants, videos]);
+    }, [participants, videos, peerStates]);
 
     const meetingParticipants = useMemo(() => {
         return [
@@ -1276,14 +2033,17 @@ export default function VideoMeetComponent() {
                 username: username || 'You',
                 isLocal: true,
                 isHost,
-                stream: cameraStreamRef.current,
-                isVideoOn: Boolean(video && videoAvailable) && (localParticipantMetadata ? localParticipantMetadata.isVideoOn !== false : true),
+                stream: localStream,
+                isVideoOn: Boolean(
+                    video && videoAvailable &&
+                    localStream?.getVideoTracks?.().some((track) => track.readyState === 'live' && track.enabled)
+                ) && (localParticipantMetadata ? localParticipantMetadata.isVideoOn !== false : true),
                 isAudioOn: Boolean(audio && audioAvailable) && (localParticipantMetadata ? localParticipantMetadata.isAudioOn !== false : true),
                 isScreenShare: false,
             },
             ...remoteParticipants,
         ];
-    }, [remoteParticipants, username, video, videoAvailable, audio, audioAvailable, localParticipantMetadata, isHost]);
+    }, [remoteParticipants, username, localStream, video, videoAvailable, audio, audioAvailable, localParticipantMetadata, isHost]);
 
     const primaryContentStream = useMemo(() => {
         const sharedStream = videos.find((entry) => entry.isScreenShare)?.stream;
@@ -1296,9 +2056,9 @@ export default function VideoMeetComponent() {
         if (primaryContentStream) {
             attachStreamToVideoElement(primaryVideoRef.current, primaryContentStream);
         } else {
-            attachStreamToVideoElement(localMeetingVideoRef.current, cameraStreamRef.current);
+            attachStreamToVideoElement(localMeetingVideoRef.current, localStream);
         }
-    }, [primaryContentStream, askForUsername, inWaitingRoom, video, audio]);
+    }, [primaryContentStream, localStream, askForUsername, inWaitingRoom, video, audio]);
 
     useEffect(() => {
         chatOpenRef.current = showModal;
@@ -1309,7 +2069,9 @@ export default function VideoMeetComponent() {
     const attendeeParticipants = remoteParticipants;
     const visibleAttendees = attendeeParticipants.slice(0, 6);
     const hiddenParticipantCount = Math.max(attendeeParticipants.length - visibleAttendees.length, 0);
-    const hasActiveLocalVideo = Boolean(cameraStreamRef.current?.getVideoTracks?.().some((track) => track.readyState === 'live' && track.enabled !== false));
+    const hasActiveLocalVideo = Boolean(
+        video && localStream?.getVideoTracks?.().some((track) => track.readyState === 'live' && track.enabled)
+    );
     const hostInitials = (hostParticipant?.username || username || 'You')
         .split(' ')
         .map((part) => part[0])
@@ -1449,19 +2211,21 @@ export default function VideoMeetComponent() {
                             <span>Meeting ID</span>
                             <strong>{meetingCode}</strong>
                             {currentBreakoutRoom && <strong>{currentBreakoutRoom.name}</strong>}
-                            <span className={styles.networkQuality} data-quality={networkQuality.toLowerCase()}>
-                                Network · {networkQuality}
+                            <span
+                                className={styles.networkQuality}
+                                data-quality={networkQuality.toLowerCase()}
+                                title={networkQualityDetails}
+                                aria-label={`Network quality: ${networkQuality}. ${networkQualityDetails}`}
+                            >
+                                <span className={styles.networkQualityDot} aria-hidden="true" />
+                                Network · {networkQuality === "Checking" ? "Checking…" : networkQuality}
                             </span>
                             <FormControl size="small" className={styles.qualityControl}>
                                 <Select
                                     value={videoQualityMode}
                                     onChange={(event) => {
                                         setVideoQualityMode(event.target.value);
-                                        if (event.target.value !== "auto") {
-                                            setActiveVideoQuality(event.target.value);
-                                            qualityLastChangedRef.current = Date.now();
-                                            applyVideoQuality(event.target.value);
-                                        }
+                                        qualityLastChangedRef.current = Date.now();
                                     }}
                                     inputProps={{ "aria-label": "Outgoing video quality" }}
                                 >
@@ -1537,9 +2301,16 @@ export default function VideoMeetComponent() {
                                     <>
                                         <video
                                             className={styles.meetUserVideo}
-                                            ref={localMeetingVideoRef}
+                                            ref={(element) => {
+                                                localMeetingVideoRef.current = element;
+                                                // Callback refs run when this conditional video mounts, including
+                                                // after screen sharing ends. Reattach the current local stream then.
+                                                if (element) {
+                                                    attachStreamToVideoElement(element, localStream, { muted: true });
+                                                }
+                                            }}
                                             autoPlay
-                                            muted
+                                            muted={true}
                                             playsInline
                                         ></video>
                                         {!hasActiveLocalVideo && (

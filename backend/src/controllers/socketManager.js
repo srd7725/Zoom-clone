@@ -12,6 +12,13 @@ const breakoutSessions = {};
 const whiteboardStates = {};
 const whiteboardRateLimits = {};
 
+// EqualTalk: per-room speaking analytics (in-memory, accumulated per meeting)
+const roomSpeakingStats = {};   // roomName -> { [socketId]: { username, totalMs, sessionStart } }
+const roomMeetingStartTime = {}; // roomName -> Date
+
+// SmartRecap: per-room join/leave history with timestamps
+const roomJoinHistory = {};     // roomName -> [ { socketId, username, joinedAt, leftAt } ]
+
 const normalizePath = (path) => {
     if (!path) return "";
 
@@ -38,6 +45,9 @@ const getRoomInfo = (roomName) => {
     if (!breakoutSessions[roomName]) {
         breakoutSessions[roomName] = { active: false, rooms: {}, assignments: {} };
     }
+    if (!roomSpeakingStats[roomName]) roomSpeakingStats[roomName] = {};
+    if (!roomJoinHistory[roomName]) roomJoinHistory[roomName] = [];
+    if (!roomMeetingStartTime[roomName]) roomMeetingStartTime[roomName] = new Date();
     return { roomName };
 };
 
@@ -96,6 +106,16 @@ const notifyPeerConnections = (io, channel, joiningSocketId) => {
         if (socketId === joiningSocketId) continue;
         const participant = roomUsers[userRooms[socketId]]?.[socketId];
         if (!participant) continue;
+        console.info("[WEBRTC_DIAG] Announcing mesh peer", {
+            meetingId: userRooms[joiningSocketId],
+            channel,
+            existingSocketId: socketId,
+            existingParticipantId: participant.socketId,
+            existingIsHost: participant.isHost === true,
+            joiningSocketId,
+            joiningParticipantId: joiningParticipant.socketId,
+            joiningIsHost: joiningParticipant.isHost === true,
+        });
         io.to(socketId).emit("user-connected", {
             ...joiningParticipant,
             shouldInitiate: socketId < joiningSocketId,
@@ -145,11 +165,54 @@ const moveParticipantToBreakout = (io, meetingCode, socketId, breakoutId) => {
         : null
     );
     (roomMessages[newChannel] || []).forEach((message) => {
-        participantSocket.emit("chat-message", message.data, message.sender, message.socketId);
+        participantSocket.emit("chat-message", message.data, message.sender, message.socketId, message.timestamp);
     });
     notifyPeerConnections(io, newChannel, socketId);
     emitParticipants(io, meetingCode);
     return true;
+};
+
+// EqualTalk helper: build analytics snapshot for a room
+const buildSpeakingSnapshot = (roomName) => {
+    const stats = roomSpeakingStats[roomName] || {};
+    let totalMs = 0;
+    const entries = Object.values(stats).map(s => {
+        // If currently speaking, add the running session
+        let accumulatedMs = s.totalMs;
+        if (s.speakingStartedAt) {
+            accumulatedMs += (Date.now() - s.speakingStartedAt);
+        }
+        totalMs += accumulatedMs;
+        return {
+            socketId: s.socketId,
+            username: s.username,
+            totalMs: accumulatedMs,
+            isSpeaking: Boolean(s.speakingStartedAt),
+        };
+    });
+
+    const withPercentages = entries.map(e => ({
+        ...e,
+        percentage: totalMs > 0 ? parseFloat(((e.totalMs / totalMs) * 100).toFixed(1)) : 0,
+    }));
+
+    // Compute balance score (normalised entropy)
+    const eligible = withPercentages.filter(e => e.totalMs > 0);
+    let balanceScore = null;
+    if (eligible.length >= 2) {
+        const total = eligible.reduce((sum, e) => sum + e.totalMs, 0);
+        const shares = eligible.map(e => e.totalMs / total);
+        const entropy = -shares.reduce((sum, p) => sum + p * Math.log(p), 0);
+        const maxEntropy = Math.log(eligible.length);
+        balanceScore = Math.round((entropy / maxEntropy) * 100);
+    }
+
+    return {
+        participants: withPercentages,
+        totalMs,
+        balanceScore,
+        meetingStartedAt: roomMeetingStartTime[roomName] || null,
+    };
 };
 
 export const connectToSocket = (server) => {
@@ -192,6 +255,12 @@ export const connectToSocket = (server) => {
                     )
                 );
                 if (!authorizedHost) {
+                    console.warn("[WEBRTC_DIAG] Host join authorization rejected", {
+                        meetingId: room,
+                        participantId: socket.id,
+                        username: username.trim(),
+                        requestedHost: true,
+                    });
                     acknowledge?.({ ok: false, message: "Only the meeting owner can join as host." });
                     return;
                 }
@@ -202,16 +271,35 @@ export const connectToSocket = (server) => {
             const waitingRoom = roomWaiting[room];
 
             userRooms[socket.id] = room;
+            const joinedAt = new Date();
             roomState[socket.id] = { 
                 socketId: socket.id, 
                 username: username.trim(),
                 isHost: authorizedHost,
-                joinedAt: new Date(),
+                joinedAt,
                 isVideoOn: isVideoOn !== undefined ? isVideoOn : true,
                 isAudioOn: isAudioOn !== undefined ? isAudioOn : true,
                 canUseMic: true,
                 canUseCamera: true
             };
+
+            // SmartRecap: record join event
+            roomJoinHistory[room].push({
+                socketId: socket.id,
+                username: username.trim(),
+                joinedAt,
+                leftAt: null
+            });
+
+            // EqualTalk: initialize speaking stats entry
+            if (!roomSpeakingStats[room][socket.id]) {
+                roomSpeakingStats[room][socket.id] = {
+                    socketId: socket.id,
+                    username: username.trim(),
+                    totalMs: 0,
+                    speakingStartedAt: null,
+                };
+            }
 
             if (authorizedHost) {
                 roomHosts[room] = socket.id;
@@ -256,6 +344,14 @@ export const connectToSocket = (server) => {
             }
 
             socket.join(room);
+            console.info("[WEBRTC_DIAG] Participant joined active room", {
+                meetingId: room,
+                socketId: socket.id,
+                participantId: socket.id,
+                username: username.trim(),
+                requestedHost: isHost === true,
+                isHost: authorizedHost,
+            });
             await syncMeetingWithSocketState(room, {
                 $set: {
                     waitingRoom: (roomWaiting[room] || []).filter((entry) => entry.socketId !== socket.id)
@@ -268,11 +364,15 @@ export const connectToSocket = (server) => {
             emitParticipants(io, room);
 
             roomMessages[room].forEach((message) => {
-                socket.emit("chat-message", message.data, message.sender, message.socketId);
+                socket.emit("chat-message", message.data, message.sender, message.socketId, message.timestamp);
             });
             socket.emit("breakout-state", authorizedHost
                 ? { active: breakoutSessions[room].active, rooms: breakoutSessions[room].rooms, assignments: breakoutSessions[room].assignments }
                 : { active: breakoutSessions[room].active, currentRoom: null });
+            
+            // Send join history for SmartRecap
+            socket.emit("recap-join-history", { joinedAt: joinedAt.toISOString(), meetingStartedAt: (roomMeetingStartTime[room] || joinedAt).toISOString() });
+
             acknowledge?.({ ok: true, waiting: false });
         });
 
@@ -299,6 +399,13 @@ export const connectToSocket = (server) => {
             });
 
             io.sockets.sockets.get(participantSocketId)?.join(room);
+            console.info("[WEBRTC_DIAG] Participant admitted to active room", {
+                meetingId: room,
+                hostSocketId: socket.id,
+                participantSocketId,
+                participantId: participantSocketId,
+                username: participant.username,
+            });
             io.to(participantSocketId).emit("admitted");
             io.to(participantSocketId).emit("participant-admitted");
             io.to(participantSocketId).emit("breakout-state", {
@@ -311,7 +418,14 @@ export const connectToSocket = (server) => {
             // Send existing chat messages to newly admitted user
             const messages = roomMessages[room] || [];
             messages.forEach((message) => {
-                io.to(participantSocketId).emit("chat-message", message.data, message.sender, message.socketId);
+                io.to(participantSocketId).emit("chat-message", message.data, message.sender, message.socketId, message.timestamp);
+            });
+
+            // Send join/recap info
+            const joinedAt = participant.joinedAt || new Date();
+            io.to(participantSocketId).emit("recap-join-history", {
+                joinedAt: joinedAt.toISOString(),
+                meetingStartedAt: (roomMeetingStartTime[room] || joinedAt).toISOString()
             });
         });
 
@@ -584,10 +698,35 @@ export const connectToSocket = (server) => {
             if (!room || !payload || typeof payload.target !== "string" ||
                 !payload.sdp || payload.sdp.type !== "offer" || typeof payload.sdp.sdp !== "string" || payload.sdp.sdp.length > 100000 ||
                 !(rooms[room] || []).includes(socket.id) ||
-                !(rooms[room] || []).includes(payload.target)) return;
+                !(rooms[room] || []).includes(payload.target)) {
+                console.warn("[WEBRTC_DIAG] Dropped offer", {
+                    meetingId: room || null,
+                    senderSocketId: socket.id,
+                    recipientSocketId: payload?.target || null,
+                    senderActive: Boolean(room && (rooms[room] || []).includes(socket.id)),
+                    recipientActive: Boolean(room && payload?.target && (rooms[room] || []).includes(payload.target)),
+                    validOffer: Boolean(payload?.sdp?.type === "offer" && typeof payload.sdp.sdp === "string" && payload.sdp.sdp.length <= 100000),
+                });
+                return;
+            }
             const channel = getActiveChannel(room, socket.id);
             if (getActiveChannel(room, payload.target) !== channel ||
-                !io.sockets.sockets.get(payload.target)?.rooms.has(channel)) return;
+                !io.sockets.sockets.get(payload.target)?.rooms.has(channel)) {
+                console.warn("[WEBRTC_DIAG] Dropped offer for peer in another channel", {
+                    meetingId: room,
+                    channel,
+                    senderSocketId: socket.id,
+                    recipientSocketId: payload.target,
+                    recipientChannel: getActiveChannel(room, payload.target),
+                });
+                return;
+            }
+            console.debug("[WEBRTC_DIAG] Relaying offer", {
+                meetingId: room,
+                senderSocketId: socket.id,
+                recipientSocketId: payload.target,
+                signalingType: payload.sdp.type,
+            });
             io.to(payload.target).emit("offer", { ...payload, sender: socket.id });
         });
 
@@ -596,10 +735,35 @@ export const connectToSocket = (server) => {
             if (!room || !payload || typeof payload.target !== "string" ||
                 !payload.sdp || payload.sdp.type !== "answer" || typeof payload.sdp.sdp !== "string" || payload.sdp.sdp.length > 100000 ||
                 !(rooms[room] || []).includes(socket.id) ||
-                !(rooms[room] || []).includes(payload.target)) return;
+                !(rooms[room] || []).includes(payload.target)) {
+                console.warn("[WEBRTC_DIAG] Dropped answer", {
+                    meetingId: room || null,
+                    senderSocketId: socket.id,
+                    recipientSocketId: payload?.target || null,
+                    senderActive: Boolean(room && (rooms[room] || []).includes(socket.id)),
+                    recipientActive: Boolean(room && payload?.target && (rooms[room] || []).includes(payload.target)),
+                    validAnswer: Boolean(payload?.sdp?.type === "answer" && typeof payload.sdp.sdp === "string" && payload.sdp.sdp.length <= 100000),
+                });
+                return;
+            }
             const channel = getActiveChannel(room, socket.id);
             if (getActiveChannel(room, payload.target) !== channel ||
-                !io.sockets.sockets.get(payload.target)?.rooms.has(channel)) return;
+                !io.sockets.sockets.get(payload.target)?.rooms.has(channel)) {
+                console.warn("[WEBRTC_DIAG] Dropped answer for peer in another channel", {
+                    meetingId: room,
+                    channel,
+                    senderSocketId: socket.id,
+                    recipientSocketId: payload.target,
+                    recipientChannel: getActiveChannel(room, payload.target),
+                });
+                return;
+            }
+            console.debug("[WEBRTC_DIAG] Relaying answer", {
+                meetingId: room,
+                senderSocketId: socket.id,
+                recipientSocketId: payload.target,
+                signalingType: payload.sdp.type,
+            });
             io.to(payload.target).emit("answer", { ...payload, sender: socket.id });
         });
 
@@ -609,10 +773,34 @@ export const connectToSocket = (server) => {
                 !payload.candidate || typeof payload.candidate.candidate !== "string" ||
                 payload.candidate.candidate.length > 4096 ||
                 !(rooms[room] || []).includes(socket.id) ||
-                !(rooms[room] || []).includes(payload.target)) return;
+                !(rooms[room] || []).includes(payload.target)) {
+                console.warn("[WEBRTC_DIAG] Dropped ICE candidate", {
+                    meetingId: room || null,
+                    senderSocketId: socket.id,
+                    recipientSocketId: payload?.target || null,
+                    senderActive: Boolean(room && (rooms[room] || []).includes(socket.id)),
+                    recipientActive: Boolean(room && payload?.target && (rooms[room] || []).includes(payload.target)),
+                    validCandidate: Boolean(typeof payload?.candidate?.candidate === "string" && payload.candidate.candidate.length <= 4096),
+                });
+                return;
+            }
             const channel = getActiveChannel(room, socket.id);
             if (getActiveChannel(room, payload.target) !== channel ||
-                !io.sockets.sockets.get(payload.target)?.rooms.has(channel)) return;
+                !io.sockets.sockets.get(payload.target)?.rooms.has(channel)) {
+                console.warn("[WEBRTC_DIAG] Dropped ICE candidate for peer in another channel", {
+                    meetingId: room,
+                    channel,
+                    senderSocketId: socket.id,
+                    recipientSocketId: payload.target,
+                    recipientChannel: getActiveChannel(room, payload.target),
+                });
+                return;
+            }
+            console.debug("[WEBRTC_DIAG] Relaying ICE candidate", {
+                meetingId: room,
+                senderSocketId: socket.id,
+                recipientSocketId: payload.target,
+            });
             io.to(payload.target).emit("ice-candidate", { ...payload, sender: socket.id });
         });
 
@@ -622,11 +810,12 @@ export const connectToSocket = (server) => {
                 !(rooms[room] || []).includes(socket.id)) return;
             const channel = getActiveChannel(room, socket.id);
             if (!io.sockets.sockets.get(socket.id)?.rooms.has(channel)) return;
-            const messageEntry = { data: data.trim(), sender: roomUsers[room]?.[socket.id]?.username || "Guest", socketId: socket.id };
+            const timestamp = new Date().toISOString();
+            const messageEntry = { data: data.trim(), sender: roomUsers[room]?.[socket.id]?.username || "Guest", socketId: socket.id, timestamp };
             roomMessages[channel] = roomMessages[channel] || [];
             roomMessages[channel].push(messageEntry);
             if (roomMessages[channel].length > 500) roomMessages[channel].shift();
-            io.to(channel).emit("chat-message", messageEntry.data, messageEntry.sender, socket.id);
+            io.to(channel).emit("chat-message", messageEntry.data, messageEntry.sender, socket.id, timestamp);
         });
 
         socket.on("whiteboard-join", () => {
@@ -716,6 +905,86 @@ export const connectToSocket = (server) => {
             }
         });
 
+        // ─── EqualTalk: Speaking detection events ───────────────────────────────
+        socket.on("speaking-started", () => {
+            const room = userRooms[socket.id];
+            if (!room || !(rooms[room] || []).includes(socket.id)) return;
+            const stats = roomSpeakingStats[room];
+            if (!stats) return;
+            if (!stats[socket.id]) {
+                const participant = roomUsers[room]?.[socket.id];
+                stats[socket.id] = {
+                    socketId: socket.id,
+                    username: participant?.username || "Guest",
+                    totalMs: 0,
+                    speakingStartedAt: null,
+                };
+            }
+            // Only start timer if not already speaking
+            if (!stats[socket.id].speakingStartedAt) {
+                stats[socket.id].speakingStartedAt = Date.now();
+            }
+            // Broadcast to room so dashboards can update
+            io.to(room).emit("participant-speaking", { socketId: socket.id, isSpeaking: true });
+        });
+
+        socket.on("speaking-stopped", () => {
+            const room = userRooms[socket.id];
+            if (!room || !(rooms[room] || []).includes(socket.id)) return;
+            const stats = roomSpeakingStats[room];
+            if (!stats || !stats[socket.id]) return;
+            if (stats[socket.id].speakingStartedAt) {
+                const elapsed = Date.now() - stats[socket.id].speakingStartedAt;
+                stats[socket.id].totalMs += Math.max(0, elapsed);
+                stats[socket.id].speakingStartedAt = null;
+            }
+            io.to(room).emit("participant-speaking", { socketId: socket.id, isSpeaking: false });
+        });
+
+        // Request current EqualTalk snapshot (throttled by client)
+        socket.on("request-speaking-stats", () => {
+            const room = userRooms[socket.id];
+            if (!room || !(rooms[room] || []).includes(socket.id)) return;
+            socket.emit("speaking-stats-update", buildSpeakingSnapshot(room));
+        });
+
+        // ─── SmartRecap: request recap for a missed interval ────────────────────
+        socket.on("request-recap", ({ missedFrom, missedTo }) => {
+            const room = userRooms[socket.id];
+            if (!room || !(rooms[room] || []).includes(socket.id)) return;
+            if (!missedFrom || !missedTo) return;
+
+            const from = new Date(missedFrom);
+            const to = new Date(missedTo);
+            if (isNaN(from.getTime()) || isNaN(to.getTime()) || from >= to) return;
+
+            // Filter chat messages in that window
+            const allMessages = (roomMessages[room] || []).filter(m => {
+                if (!m.timestamp) return false;
+                const t = new Date(m.timestamp);
+                return t >= from && t <= to;
+            });
+
+            // Filter join/leave events in that window
+            const events = (roomJoinHistory[room] || []).filter(e => {
+                const j = new Date(e.joinedAt);
+                const l = e.leftAt ? new Date(e.leftAt) : null;
+                return (j >= from && j <= to) || (l && l >= from && l <= to);
+            }).map(e => ({
+                type: e.leftAt ? "left" : "joined",
+                username: e.username,
+                timestamp: e.leftAt || e.joinedAt,
+            }));
+
+            socket.emit("recap-result", {
+                missedFrom: from.toISOString(),
+                missedTo: to.toISOString(),
+                messages: allMessages,
+                events,
+                meetingCode: room,
+            });
+        });
+
         socket.on("leave-room", (roomName) => {
             const room = normalizePath(roomName);
             handleSocketLeave(io, socket, room);
@@ -725,9 +994,13 @@ export const connectToSocket = (server) => {
             const room = normalizePath(roomName);
             if (roomHosts[room] !== socket.id) return;
 
+            // Build final EqualTalk summary before clearing
+            const finalStats = buildSpeakingSnapshot(room);
+
             const participants = rooms[room] || [];
             participants.forEach((participantSocketId) => {
                 io.to(participantSocketId).emit("meeting-ended");
+                io.to(participantSocketId).emit("equaltalk-final-summary", finalStats);
             });
 
             await syncMeetingWithSocketState(room, {
@@ -744,6 +1017,9 @@ export const connectToSocket = (server) => {
             delete roomMessages[room];
             delete roomWaiting[room];
             delete roomHosts[room];
+            delete roomSpeakingStats[room];
+            delete roomJoinHistory[room];
+            delete roomMeetingStartTime[room];
             Object.keys(breakoutSessions[room]?.rooms || {}).forEach((breakoutId) => {
                 const channel = getBreakoutChannel(room, breakoutId);
                 delete roomMessages[channel];
@@ -786,6 +1062,21 @@ const handleSocketLeave = async (io, socket, room) => {
     const index = roomSockets.indexOf(socket.id);
     if (index >= 0) {
         roomSockets.splice(index, 1);
+    }
+
+    // EqualTalk: stop speaking timer on leave
+    const stats = roomSpeakingStats[room];
+    if (stats && stats[socket.id] && stats[socket.id].speakingStartedAt) {
+        const elapsed = Date.now() - stats[socket.id].speakingStartedAt;
+        stats[socket.id].totalMs += Math.max(0, elapsed);
+        stats[socket.id].speakingStartedAt = null;
+        io.to(room).emit("participant-speaking", { socketId: socket.id, isSpeaking: false });
+    }
+
+    // SmartRecap: record leave time
+    if (roomJoinHistory[room]) {
+        const entry = [...roomJoinHistory[room]].reverse().find(e => e.socketId === socket.id && !e.leftAt);
+        if (entry) entry.leftAt = new Date();
     }
 
     if (roomUsers[room]) {
